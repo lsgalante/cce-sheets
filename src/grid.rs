@@ -21,7 +21,7 @@ use crate::book::column_name;
 use crate::view::{SheetGeom, View};
 
 /// Room between a cell's wall and its text.
-const CELL_PAD: f32 = 3.0;
+pub const CELL_PAD: f32 = 3.0;
 /// Header strip tint, over the well floor.
 const HEADER_TINT: [f32; 4] = [1.0, 1.0, 1.0, 0.04];
 const GRIDLINE: [f32; 4] = [1.0, 1.0, 1.0, 0.08];
@@ -141,7 +141,10 @@ pub struct Selection {
     pub range: [i32; 4],
 }
 
-pub fn paint_sheet(pc: &mut PaintCtx, model: &UserModel, sheet: u32, view: &View, face: &Face, sel: &Selection) {
+/// `hide`: where the in-cell editor stands. Text is drawn in a pass above
+/// every fill, so the editor's box cannot cover a value: the cells under it
+/// draw none, and overflow from either side stops at its edge.
+pub fn paint_sheet(pc: &mut PaintCtx, model: &UserModel, sheet: u32, view: &View, face: &Face, sel: &Selection, hide: Option<Rect>) {
     let area = view.area;
     let body = view.body();
     let cols = view.cols();
@@ -187,7 +190,7 @@ pub fn paint_sheet(pc: &mut PaintCtx, model: &UserModel, sheet: u32, view: &View
                 }
             }
         }
-        paint_text(pc, view, face, &cells, &col_list);
+        paint_text(pc, view, face, &cells, &col_list, hide);
         paint_cursor(pc, view, face, sel);
     });
 
@@ -258,7 +261,7 @@ fn collect_cells(model: &UserModel, sheet: u32, view: &View, face: &Face, rows: 
     out
 }
 
-fn paint_text(pc: &mut PaintCtx, view: &View, face: &Face, cells: &[CellPaint], cols: &[i32]) {
+fn paint_text(pc: &mut PaintCtx, view: &View, face: &Face, cells: &[CellPaint], cols: &[i32], hide: Option<Rect>) {
     let filled: std::collections::HashSet<(i32, i32)> = cells.iter().filter(|c| !c.text.is_empty()).map(|c| (c.row, c.col)).collect();
     let occupied = |row: i32, col: i32| filled.contains(&(row, col));
     for cell in cells.iter().filter(|c| !c.text.is_empty()) {
@@ -304,10 +307,24 @@ fn paint_text(pc: &mut PaintCtx, view: &View, face: &Face, cells: &[CellPaint], 
             Align::Center => cell.rect.x + (cell.rect.width - width) / 2.0,
         };
         let y = cce_ui::layout::center_text_y(cell.rect.y, cell.rect.height, face.size);
-        let clip_l = left.max(bx0);
-        let clip_r = (right - CELL_PAD * 0.5).min(bx1);
+        let mut clip_l = left.max(bx0);
+        let mut clip_r = (right - CELL_PAD * 0.5).min(bx1);
         let clip_t = cell.rect.y.max(by0);
         let clip_b = (cell.rect.y + cell.rect.height).min(by1);
+        if let Some(h) = hide {
+            let rows_meet = clip_t < h.y + h.height && clip_b > h.y;
+            let (h0, h1) = (h.x, h.x + h.width);
+            if rows_meet && clip_l < h1 && clip_r > h0 {
+                if cell.rect.x < h1 && cell.rect.x + cell.rect.width > h0 {
+                    continue;
+                }
+                if cell.rect.x < h0 {
+                    clip_r = clip_r.min(h0);
+                } else {
+                    clip_l = clip_l.max(h1);
+                }
+            }
+        }
         if clip_r <= clip_l || clip_b <= clip_t {
             continue;
         }
@@ -350,17 +367,23 @@ pub fn fit_general(text: &str, max: usize) -> Option<String> {
 /// The selected cell's frame, in its quadrant.
 fn paint_cursor(pc: &mut PaintCtx, view: &View, face: &Face, sel: &Selection) {
     let r = view.cell_rect(sel.row, sel.col);
-    let t = 2.0;
-    // The highlight lifted a third toward white: the frame has to read on a
-    // filled cell as well as on the bare well.
+    clipped_to_cell_band(pc, view, sel.row, sel.col, |pc| frame(pc, r, cursor_color(face)));
+}
+
+/// The cursor's colour: the highlight lifted a third toward white, so the
+/// frame reads on a filled cell as well as on the bare well.
+pub fn cursor_color(face: &Face) -> [f32; 4] {
     let h = face.highlight;
-    let c = [h[0] + (1.0 - h[0]) / 3.0, h[1] + (1.0 - h[1]) / 3.0, h[2] + (1.0 - h[2]) / 3.0, 1.0];
-    clipped_to_cell_band(pc, view, sel.row, sel.col, |pc| {
-        pc.quad(Rect { x: r.x, y: r.y, width: r.width, height: t }, c);
-        pc.quad(Rect { x: r.x, y: r.y + r.height - t, width: r.width, height: t }, c);
-        pc.quad(Rect { x: r.x, y: r.y, width: t, height: r.height }, c);
-        pc.quad(Rect { x: r.x + r.width - t, y: r.y, width: t, height: r.height }, c);
-    });
+    [h[0] + (1.0 - h[0]) / 3.0, h[1] + (1.0 - h[1]) / 3.0, h[2] + (1.0 - h[2]) / 3.0, 1.0]
+}
+
+/// A 2px frame just inside `r`.
+pub fn frame(pc: &mut PaintCtx, r: Rect, c: [f32; 4]) {
+    let t = 2.0;
+    pc.quad(Rect { x: r.x, y: r.y, width: r.width, height: t }, c);
+    pc.quad(Rect { x: r.x, y: r.y + r.height - t, width: r.width, height: t }, c);
+    pc.quad(Rect { x: r.x, y: r.y, width: t, height: r.height }, c);
+    pc.quad(Rect { x: r.x + r.width - t, y: r.y, width: t, height: r.height }, c);
 }
 
 fn paint_headers(pc: &mut PaintCtx, view: &View, face: &Face, rows: &[i32], cols: &[i32], range: (i32, i32, i32, i32)) {

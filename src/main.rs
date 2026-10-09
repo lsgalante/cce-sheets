@@ -2,21 +2,30 @@
 //!
 //! The workbook is IronCalc's `UserModel`, which owns the cells, formulas,
 //! styles and the selection; this app draws it and turns input into model
-//! calls. Milestone 1 is a viewer: open .xlsx / .csv / .tsv, scroll, select
-//! cells and ranges, switch sheets, and read a cell's formula in the bar.
+//! calls: open .xlsx / .csv / .tsv, scroll, select, edit cells in place or in
+//! the formula bar, undo, and save.
 //!
 //! Keys: arrows / Enter / Tab move · shift extends · ctrl+arrow jumps to an
 //! edge · PageUp/PageDown · ctrl+Home/End · ctrl+PageUp/PageDown change
-//! sheet · ctrl+o open. Wheel scrolls (shift for horizontal); press, drag
-//! and shift+press select; header presses select a whole column or row.
+//! sheet. Typing replaces the selected cell, F2 edits it, Delete clears the
+//! selection, Escape abandons an edit; ctrl+z / ctrl+shift+z undo and redo.
+//! ctrl+s saves, ctrl+shift+s saves as, ctrl+o opens. Wheel scrolls (shift
+//! for horizontal); press, drag and shift+press select; header presses select
+//! a whole column or row; a double-click edits.
+//!
+//! Closing with unsaved changes keeps them: `on_exit` writes a recovery copy
+//! under `$XDG_STATE_HOME/cce-sheets/recovered/` (the toolkit has no way to
+//! ask before a window closes).
 
 mod axis;
 mod book;
+mod edit;
 mod grid;
 mod view;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::scene::layout::Rect;
@@ -24,15 +33,19 @@ use cce_ui::scene::paint::{ControlPlate, DisplayList, PaintCtx, PlateStance};
 use cce_ui::scene::Material;
 use cce_ui::widget::scroll_motion::{Bounds, ScrollMotion};
 use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
+use ironcalc::base::expressions::types::Area;
 use ironcalc::base::worksheet::NavigationDirection;
 
 use book::{column_name, Book, SHEET_EXTS};
+use edit::{CellEdit, EditKey, Marks};
 use grid::{dim, Face, Selection};
 use view::{Hit, SheetGeom, View};
 
 const WHEEL_LINE_PX: f32 = 48.0;
 /// The formula bar's and the sheet tabs' height.
 const BAR_H: f32 = 28.0;
+/// Two presses on one cell this close together are a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 #[derive(Debug, Clone)]
 enum Message {}
@@ -49,19 +62,36 @@ struct Frame {
     header_w: f32,
     header_h: f32,
     tabs: Vec<(Rect, u32)>,
+    /// The in-cell editor's box while a cell is edited in place.
+    editor: Option<Rect>,
 }
 
 const NO_RECT: Rect = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
 
 impl Default for Frame {
     fn default() -> Self {
-        Frame { address: NO_RECT, content: NO_RECT, well: NO_RECT, area: NO_RECT, header_w: 0.0, header_h: 0.0, tabs: Vec::new() }
+        Frame { address: NO_RECT, content: NO_RECT, well: NO_RECT, area: NO_RECT, header_w: 0.0, header_h: 0.0, tabs: Vec::new(), editor: None }
     }
+}
+
+/// A line in the tab row: what a save did, or what went wrong.
+struct Status {
+    text: String,
+    error: bool,
 }
 
 struct SheetsApp {
     book: Book,
-    error: Option<String>,
+    status: Option<Status>,
+    /// Changes since the last save.
+    dirty: bool,
+    editing: Option<CellEdit>,
+    /// A press in an edited field is held: drags select text.
+    edit_drag: bool,
+    /// The last press on a cell, for telling a double-click.
+    last_press: Option<(Instant, i32, i32)>,
+    /// Shapes the edited text for its caret and click positions.
+    font_system: cce_ui::cosmic_text::FontSystem,
     /// The selected sheet's measurements; rebuilt when the sheet changes.
     geom: SheetGeom,
     geom_sheet: u32,
@@ -80,12 +110,17 @@ struct SheetsApp {
 }
 
 impl SheetsApp {
-    fn with_book(book: Book, error: Option<String>) -> Self {
+    fn with_book(book: Book, error: Option<String>, font_system: cce_ui::cosmic_text::FontSystem) -> Self {
         let sheet = book.model.get_selected_sheet();
         let geom = grid::sheet_geom(&book.model, sheet);
         SheetsApp {
             book,
-            error,
+            status: error.map(|text| Status { text, error: true }),
+            dirty: false,
+            editing: None,
+            edit_drag: false,
+            last_press: None,
+            font_system,
             geom,
             geom_sheet: sheet,
             scroll: (0.0, 0.0),
@@ -103,12 +138,178 @@ impl SheetsApp {
 
     fn open(&mut self, path: &std::path::Path) {
         match Book::open(path) {
-            Ok(book) => *self = SheetsApp::with_book(book, None),
-            Err(e) => self.error = Some(format!("{}: {e}", path.display())),
+            Ok(book) => {
+                self.keep_unsaved();
+                self.end_edit();
+                self.load(book);
+            }
+            Err(e) => self.set_status(format!("{}: {e}", path.display()), true),
+        }
+    }
+
+    /// Show `book` in place of the current workbook.
+    fn load(&mut self, book: Book) {
+        let sheet = book.model.get_selected_sheet();
+        self.geom = grid::sheet_geom(&book.model, sheet);
+        self.geom_sheet = sheet;
+        self.book = book;
+        self.status = None;
+        self.dirty = false;
+        self.last_press = None;
+        self.scroll = (0.0, 0.0);
+        self.scrolls.clear();
+        self.scroll_motion = ScrollMotion::new();
+    }
+
+    fn set_status(&mut self, text: String, error: bool) {
+        if error {
+            log::warn!("{text}");
+        }
+        self.status = Some(Status { text, error });
+    }
+
+    /// Before the workbook is let go with unsaved changes (a close, another
+    /// file opened over it): write a recovery copy and say where.
+    fn keep_unsaved(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        match book::save_recovery(&self.book) {
+            Ok(p) => log::warn!("unsaved changes to {} kept in {}", self.book.display_name(), p.display()),
+            Err(e) => log::error!("unsaved changes to {} could not be kept: {e}", self.book.display_name()),
+        }
+    }
+
+    /// After the model changed: mark it unsaved, drop the engine's
+    /// collaboration queue (nothing here sends it), and re-read sizes.
+    fn changed(&mut self) {
+        self.dirty = true;
+        let _ = self.book.model.flush_send_queue();
+        let sheet = self.sheet();
+        self.geom = grid::sheet_geom(&self.book.model, sheet);
+        self.geom_sheet = sheet;
+    }
+
+    // ---- editing ----
+
+    fn begin_edit(&mut self, ed: CellEdit) {
+        self.status = None;
+        self.editing = Some(ed);
+    }
+
+    /// The selected cell, edited with its content (F2, a double-click, the bar).
+    fn edit_selected(&mut self, in_bar: bool) {
+        let sel = self.selection();
+        let sheet = self.sheet();
+        let content = self.book.model.get_cell_content(sheet, sel.row, sel.col).unwrap_or_default();
+        self.begin_edit(CellEdit::of_content(sheet, sel.row, sel.col, content, in_bar));
+    }
+
+    /// End an edit without writing it, letting go of the input method.
+    fn end_edit(&mut self) -> Option<CellEdit> {
+        let mut ed = self.editing.take()?;
+        ed.edit.drop_composition();
+        if cce_ui::ime::preedit().is_some() {
+            cce_ui::ime::request_reset();
+        }
+        self.edit_drag = false;
+        Some(ed)
+    }
+
+    /// Write the edit into its cell. False, with the edit still open and the
+    /// reason shown, when the engine refuses it.
+    fn commit_edit(&mut self) -> bool {
+        let Some(ed) = self.editing.as_ref() else {
+            return true;
+        };
+        let (sheet, row, col) = (ed.sheet, ed.row, ed.col);
+        let text = ed.edit.text.clone();
+        let before = self.book.model.get_cell_content(sheet, row, col).unwrap_or_default();
+        if text != before {
+            if let Err(e) = self.book.model.set_user_input(sheet, row, col, &text) {
+                self.set_status(e, true);
+                return false;
+            }
+            self.changed();
+        }
+        self.end_edit();
+        true
+    }
+
+    /// Delete: clear the selected range's contents, keeping formats. Clamped
+    /// to the used range, since a whole column is a million rows.
+    fn clear_selection(&mut self) {
+        let sel = self.selection();
+        let sheet = self.sheet();
+        let (used_r, used_c) = grid::used_extent(&self.book.model, sheet);
+        let [a, b, c, d] = sel.range;
+        let (r1, c1, r2, c2) = (a.min(c), b.min(d), a.max(c).min(used_r), b.max(d).min(used_c));
+        if r2 < r1 || c2 < c1 {
+            return;
+        }
+        let area = Area { sheet, row: r1, column: c1, width: c2 - c1 + 1, height: r2 - r1 + 1 };
+        match self.book.model.range_clear_contents(&area) {
+            Ok(()) => self.changed(),
+            Err(e) => self.set_status(e, true),
+        }
+    }
+
+    /// Marks for the edited text in the cell font, if a cell is being edited.
+    fn edit_marks(&mut self) -> Option<Marks> {
+        let face = self.face.as_ref()?;
+        let ed = self.editing.as_ref()?;
+        Some(Marks::of(&mut self.font_system, &ed.edit, face.size, &face.family))
+    }
+
+    /// The byte of the edited text under `x` in the cell editor or the bar.
+    fn edit_byte_at(&mut self, x: f32, in_bar: bool) -> Option<usize> {
+        let marks = self.edit_marks()?;
+        let ed = self.editing.as_ref()?;
+        let origin = if in_bar {
+            self.frame.content.x + cce_ui::layout::CONTROL_TEXT_INSET - ed.bar_shift
+        } else {
+            self.frame.editor?.x + grid::CELL_PAD - ed.cell_shift
+        };
+        let shown = marks.byte_at(x - origin);
+        Some(ed.edit.text_index(shown))
+    }
+
+    // ---- files ----
+
+    /// ctrl+s: to the file it came from; with no file, or `choose`, to one
+    /// picked in the save dialog.
+    fn save(&mut self, choose: bool) {
+        if !self.commit_edit() {
+            return;
+        }
+        let target = match (&self.book.path, choose) {
+            (Some(p), false) if self.book.kind != book::FileKind::Untitled => Some(p.clone()),
+            _ => {
+                let filters: &[(&str, &[&str])] = &[("Excel workbook", &["xlsx"]), ("Comma-separated", &["csv"]), ("Tab-separated", &["tsv"])];
+                cce_ui::file_dialog::save_file("Save", filters).map(|p| if p.extension().is_none() { p.with_extension("xlsx") } else { p })
+            }
+        };
+        let Some(path) = target else {
+            return;
+        };
+        match self.book.save_to(&path) {
+            Ok(note) => {
+                self.dirty = false;
+                let name = self.book.display_name();
+                let text = match note {
+                    Some(n) => format!("{name}: {n}"),
+                    None => format!("saved {name}"),
+                };
+                self.set_status(text, false);
+            }
+            Err(e) => self.set_status(format!("{}: {e}", path.display()), true),
         }
     }
 
     fn open_dialog(&mut self) {
+        if !self.commit_edit() {
+            return;
+        }
         let filters: &[(&str, &[&str])] = &[("Spreadsheets", SHEET_EXTS)];
         if let Some(path) = cce_ui::file_dialog::pick_file("Open", filters) {
             self.open(&path);
@@ -253,7 +454,7 @@ impl SheetsApp {
             let v = View { geom: &self.geom, area, header_w, header_h, scroll: self.scroll };
             header_w = grid::row_header_width(face, v.rows().last);
         }
-        self.frame = Frame { address, content, well, area, header_w, header_h, tabs };
+        self.frame = Frame { address, content, well, area, header_w, header_h, tabs, editor: None };
     }
 
     fn select_hit(&mut self, hit: Hit, extend: bool) -> bool {
@@ -329,10 +530,12 @@ impl SheetsApp {
         true
     }
 
-    fn paint_bar(&self, pc: &mut PaintCtx, face: &Face) {
+    fn paint_bar(&self, pc: &mut PaintCtx, face: &Face, marks: Option<&Marks>) {
         let sel = self.selection();
         let [r1, c1, r2, c2] = sel.range;
-        let address = if (r1, c1) == (r2, c2) {
+        let address = if let Some(ed) = &self.editing {
+            format!("{}{}", column_name(ed.col), ed.row)
+        } else if (r1, c1) == (r2, c2) {
             format!("{}{}", column_name(sel.col), sel.row)
         } else {
             format!("{}{}:{}{}", column_name(c1.min(c2)), r1.min(r2), column_name(c1.max(c2)), r1.max(r2))
@@ -342,15 +545,37 @@ impl SheetsApp {
         let radius = cce_ui::layout::control_corner_radius();
         let relief = cce_ui::layout::control_relief();
         let text_in = cce_ui::layout::CONTROL_TEXT_INSET;
-        for (rect, text) in [(self.frame.address, address), (self.frame.content, content)] {
+        for (i, (rect, text)) in [(self.frame.address, address), (self.frame.content, content)].into_iter().enumerate() {
             if rect.width <= 0.0 {
                 continue;
             }
             pc.canvas_well(rect, radius, &Material::root(), relief, false);
+            if i == 1 {
+                if let (Some(ed), Some(marks)) = (&self.editing, marks) {
+                    // The edit, mirrored; the caret here when the bar has it.
+                    let field = Rect { x: rect.x + text_in, y: rect.y, width: (rect.width - 2.0 * text_in).max(0.0), height: rect.height };
+                    paint_field(pc, field, field.x - ed.bar_shift, marks, face, face.text, ed.in_bar);
+                    continue;
+                }
+            }
             let ty = cce_ui::layout::center_text_y(rect.y, rect.height, face.size);
             let bounds = [rect.x + text_in, rect.y, rect.x + rect.width - text_in, rect.y + rect.height];
             pc.text_with(text, rect.x + text_in, ty, face.size, face.text, Some(face.family.clone()), Some(bounds));
         }
+    }
+
+    /// The in-cell editor over the grid: an opaque box at the cell, widened
+    /// to fit the text, framed like the cursor.
+    fn paint_editor(&self, pc: &mut PaintCtx, face: &Face, marks: &Marks) {
+        let (Some(ed), Some(r)) = (&self.editing, self.frame.editor) else {
+            return;
+        };
+        pc.clip(self.view().body(), |pc| {
+            pc.quad(r, EDITOR_FILL);
+            grid::frame(pc, r, grid::cursor_color(face));
+            let field = Rect { x: r.x + grid::CELL_PAD, y: r.y, width: (r.width - 2.0 * grid::CELL_PAD).max(0.0), height: r.height };
+            paint_field(pc, field, field.x - ed.cell_shift, marks, face, face.text, !ed.in_bar);
+        });
     }
 
     /// The sheet tabs as a ButtonStrip draws its recessed style: one well
@@ -397,19 +622,20 @@ impl Application for SheetsApp {
     type Message = Message;
 
     fn create(_sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
+        let fs = cce_ui::create_font_system();
         let arg: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
         match arg {
             Some(path) => match Book::open(&path) {
-                Ok(book) => SheetsApp::with_book(book, None),
-                Err(e) => SheetsApp::with_book(Book::untitled(), Some(format!("{}: {e}", path.display()))),
+                Ok(book) => SheetsApp::with_book(book, None, fs),
+                Err(e) => SheetsApp::with_book(Book::untitled(), Some(format!("{}: {e}", path.display())), fs),
             },
-            None => SheetsApp::with_book(Book::untitled(), None),
+            None => SheetsApp::with_book(Book::untitled(), None, fs),
         }
     }
 
     fn settings(&self) -> WindowSettings {
         WindowSettings {
-            title: format!("{} — Sheets", self.book.display_name()),
+            title: format!("{}{} — Sheets", if self.dirty { "*" } else { "" }, self.book.display_name()),
             app_id: "cce-sheets".to_string(),
             width: 1100,
             height: 760,
@@ -439,6 +665,15 @@ impl Application for SheetsApp {
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        if self.edit_drag {
+            let in_bar = self.editing.as_ref().is_some_and(|e| e.in_bar);
+            if let Some(at) = self.edit_byte_at(pos.x, in_bar) {
+                if self.editing.as_mut().is_some_and(|e| e.edit.drag_to(at)) {
+                    *needs_rebuild = true;
+                }
+            }
+            return;
+        }
         if self.selecting {
             let hit = self.view().hit(pos.x, pos.y);
             if let Hit::Cell { .. } = hit {
@@ -461,18 +696,55 @@ impl Application for SheetsApp {
         }
         if state == ElementState::Released {
             self.selecting = false;
+            if std::mem::take(&mut self.edit_drag) {
+                if let Some(ed) = self.editing.as_mut() {
+                    ed.edit.release();
+                }
+            }
             return None;
         }
-        if let Some(&(_, sheet)) = self.frame.tabs.iter().find(|(r, _)| contains(r, pos.x, pos.y)) {
+        *needs_rebuild = true;
+        let (x, y) = (pos.x, pos.y);
+        // A press in the field being edited, or in the bar: the caret goes there.
+        let in_editor = self.frame.editor.is_some_and(|r| contains(&r, x, y));
+        let in_bar = contains(&self.frame.content, x, y);
+        if in_editor || in_bar {
+            if self.editing.is_none() {
+                self.edit_selected(true);
+            }
+            if let Some(ed) = self.editing.as_mut() {
+                ed.in_bar = in_bar;
+            }
+            if let Some(at) = self.edit_byte_at(x, in_bar) {
+                let shift = self.shift;
+                if let Some(ed) = self.editing.as_mut() {
+                    ed.edit.press(at, shift);
+                    self.edit_drag = true;
+                }
+            }
+            return None;
+        }
+        // Anywhere else ends an edit, kept; a refused one stays open.
+        if !self.commit_edit() {
+            return None;
+        }
+        if let Some(&(_, sheet)) = self.frame.tabs.iter().find(|(r, _)| contains(r, x, y)) {
             let _ = self.book.model.set_selected_sheet(sheet);
             self.sync_sheet();
-            *needs_rebuild = true;
             return None;
         }
-        let hit = self.view().hit(pos.x, pos.y);
+        let hit = self.view().hit(x, y);
+        if let Hit::Cell { row, col } = hit {
+            let now = Instant::now();
+            let double = self.last_press.is_some_and(|(t, r, c)| (r, c) == (row, col) && now.duration_since(t) < DOUBLE_CLICK);
+            self.last_press = if double { None } else { Some((now, row, col)) };
+            if double && !self.shift {
+                self.edit_selected(false);
+                return None;
+            }
+        }
         if self.select_hit(hit, self.shift) {
             self.selecting = matches!(hit, Hit::Cell { .. });
-            *needs_rebuild = true;
         }
         None
     }
@@ -505,9 +777,63 @@ impl Application for SheetsApp {
         if event.state != ElementState::Pressed {
             return None;
         }
+        // The app's own chords, edit or no edit.
+        if let Key::Character(c) = &event.logical_key {
+            if event.ctrl && !event.alt {
+                let handled = match c.to_ascii_lowercase().as_str() {
+                    "s" => {
+                        self.save(event.shift);
+                        true
+                    }
+                    "o" => {
+                        self.open_dialog();
+                        true
+                    }
+                    _ => false,
+                };
+                if handled {
+                    *needs_rebuild = true;
+                    return None;
+                }
+            }
+        }
+        if let Some(ed) = self.editing.as_mut() {
+            match edit::classify(ed, event) {
+                EditKey::Cancel => {
+                    self.end_edit();
+                }
+                EditKey::CommitAndMove => {
+                    if self.commit_edit() {
+                        self.navigate(&event.logical_key);
+                    }
+                }
+                EditKey::Field => {
+                    ed.edit.handle_key(event);
+                }
+            }
+            *needs_rebuild = true;
+            return None;
+        }
+        let sheet = self.sheet();
+        let sel = self.selection();
         let handled = match &event.logical_key {
-            Key::Character(c) if self.ctrl && c.eq_ignore_ascii_case("o") => {
-                self.open_dialog();
+            Key::Named(NamedKey::F2) => {
+                self.edit_selected(false);
+                true
+            }
+            Key::Named(NamedKey::Delete) => {
+                self.clear_selection();
+                true
+            }
+            // Backspace starts over in the cell: an empty edit replacing it.
+            Key::Named(NamedKey::Backspace) => {
+                self.begin_edit(CellEdit::typed_over(sheet, sel.row, sel.col));
+                true
+            }
+            _ if edit::types(event) => {
+                let mut ed = CellEdit::typed_over(sheet, sel.row, sel.col);
+                ed.edit.handle_key(event);
+                self.begin_edit(ed);
                 true
             }
             key => self.navigate(key),
@@ -516,6 +842,53 @@ impl Application for SheetsApp {
             *needs_rebuild = true;
         }
         None
+    }
+
+    /// Undo: the edit's own typing while a cell is edited, else the
+    /// workbook's last change.
+    fn undo(&mut self, needs_rebuild: &mut bool) -> bool {
+        *needs_rebuild = true;
+        if let Some(ed) = self.editing.as_mut() {
+            ed.edit.undo();
+            return true;
+        }
+        if !self.book.model.can_undo() {
+            return false;
+        }
+        match self.book.model.undo() {
+            Ok(()) => {
+                self.changed();
+                self.reveal_selection();
+            }
+            Err(e) => self.set_status(e, true),
+        }
+        true
+    }
+
+    fn redo(&mut self, needs_rebuild: &mut bool) -> bool {
+        *needs_rebuild = true;
+        if let Some(ed) = self.editing.as_mut() {
+            ed.edit.redo();
+            return true;
+        }
+        if !self.book.model.can_redo() {
+            return false;
+        }
+        match self.book.model.redo() {
+            Ok(()) => {
+                self.changed();
+                self.reveal_selection();
+            }
+            Err(e) => self.set_status(e, true),
+        }
+        true
+    }
+
+    /// The window is going: an edit in progress is kept, and unsaved changes
+    /// go to a recovery copy (see the module doc).
+    fn on_exit(&mut self) {
+        self.commit_edit();
+        self.keep_unsaved();
     }
 
     fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<DisplayList> {
@@ -529,9 +902,32 @@ impl Application for SheetsApp {
         self.clamp_scroll();
         let face = self.face.clone().expect("set above");
 
+        // The edit: take up the input method's composition, measure the text,
+        // place the in-cell editor and keep each field's caret in view.
+        if let Some(ed) = self.editing.as_mut() {
+            ed.edit.sync_ime();
+        }
+        let marks = self.edit_marks();
+        self.frame.editor = None;
+        if let (Some(m), Some(ed)) = (&marks, &self.editing) {
+            let view = self.view();
+            if ed.sheet == self.sheet() {
+                let body = view.body();
+                let cell = view.cell_rect(ed.row, ed.col);
+                self.frame.editor = Some(edit::editor_rect(cell, m.width(), grid::CELL_PAD, body.x + body.width));
+            }
+        }
+        if let (Some(m), Some(ed)) = (&marks, self.editing.as_mut()) {
+            let text_in = cce_ui::layout::CONTROL_TEXT_INSET;
+            if let Some(r) = self.frame.editor {
+                ed.cell_shift = edit::keep_caret(ed.cell_shift, m.caret, m.width(), r.width - 2.0 * grid::CELL_PAD);
+            }
+            ed.bar_shift = edit::keep_caret(ed.bar_shift, m.caret, m.width(), self.frame.content.width - 2.0 * text_in);
+        }
+
         let mut pc = PaintCtx::new();
         pc.root_plate(size.width, size.height);
-        self.paint_bar(&mut pc, &face);
+        self.paint_bar(&mut pc, &face, marks.as_ref());
 
         let well = self.frame.well;
         let radius = cce_ui::layout::plate_corner_radius();
@@ -540,21 +936,57 @@ impl Application for SheetsApp {
         let sel = self.selection();
         let sheet = self.sheet();
         pc.clip_rounded(well, radius, |pc| {
-            grid::paint_sheet(pc, &self.book.model, sheet, &self.view(), &face, &sel);
+            grid::paint_sheet(pc, &self.book.model, sheet, &self.view(), &face, &sel, self.frame.editor);
+            if let Some(m) = &marks {
+                self.paint_editor(pc, &face, m);
+            }
         });
         pc.well_rim(well, radius, relief);
 
         self.paint_tabs(&mut pc, &face);
-        if let Some(err) = &self.error {
+        if let Some(status) = &self.status {
             let x = self.frame.tabs.last().map_or(self.frame.well.x, |(r, _)| r.x + r.width + cce_ui::layout::control_gap() * 2.0);
             let y = self.frame.tabs.first().map_or(self.frame.well.y, |(r, _)| cce_ui::layout::center_text_y(r.y, r.height, face.size));
-            pc.text_with(err.clone(), x, y, face.size, [0xff, 0x8a, 0x80], Some(face.family.clone()), None);
+            let color = if status.error { [0xff, 0x8a, 0x80] } else { dim(face.text) };
+            pc.text_with(status.text.clone(), x, y, face.size, color, Some(face.family.clone()), None);
         }
         Some(pc.finish())
     }
 
     fn display_list_text(&self) -> bool {
         true
+    }
+}
+
+/// The in-cell editor's ground: opaque, so the cell's own value and any
+/// overflow beneath it do not show through.
+const EDITOR_FILL: [f32; 4] = [0.055, 0.058, 0.07, 1.0];
+
+/// One edited field's text in `field` (its clip), the text starting at
+/// `origin_x`: the selection under it, the composition underlined, the caret
+/// when `caret`. A field with the caret reports it to the input method,
+/// which is also how the shell knows text input is wanted.
+fn paint_field(pc: &mut PaintCtx, field: Rect, origin_x: f32, marks: &Marks, face: &Face, color: [u8; 3], caret: bool) {
+    let ty = cce_ui::layout::center_text_y(field.y, field.height, face.size);
+    let (top, h) = (field.y + 3.0, (field.height - 6.0).max(1.0));
+    let sel_fill = {
+        let c = face.highlight;
+        [c[0], c[1], c[2], 0.45]
+    };
+    pc.clip(field, |pc| {
+        if let Some((a, b)) = marks.selection {
+            pc.quad(Rect { x: origin_x + a, y: top, width: b - a, height: h }, sel_fill);
+        }
+        pc.text_with(marks.shown.clone(), origin_x, ty, face.size, color, Some(face.family.clone()), None);
+        if let Some((a, b)) = marks.composition {
+            pc.quad(Rect { x: origin_x + a, y: top + h - 1.0, width: b - a, height: 1.0 }, [1.0, 1.0, 1.0, 0.8]);
+        }
+    });
+    if caret {
+        let x = (origin_x + marks.caret).clamp(field.x, field.x + field.width);
+        let rect = Rect { x, y: top, width: (face.hair * 2.0).max(1.0), height: h };
+        pc.quad(rect, [1.0, 1.0, 1.0, 0.95]);
+        cce_ui::ime::report_caret(rect.x, rect.y, rect.width, rect.height);
     }
 }
 
