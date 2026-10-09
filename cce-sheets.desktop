@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sheets
+GenericName=Spreadsheet
+Comment=View and edit spreadsheets
+Exec=cce-sheets %f
+Icon=cce-sheets
+Terminal=false
+Categories=Office;Spreadsheet;
+MimeType=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;text/csv;text/tab-separated-values;
+NoDisplay=false
