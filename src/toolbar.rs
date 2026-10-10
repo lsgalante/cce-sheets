@@ -119,7 +119,7 @@ pub fn paint(pc: &mut PaintCtx, groups: &[Vec<(Rect, Tool)>], a: &Active, face: 
                     pc.icon(tool.glyph(), Rect { x: gx, y: r.y + r.height * 0.14, width: s, height: s }, ink);
                     let bar = Rect { x: gx - 1.0, y: r.y + r.height * 0.7, width: s + 2.0, height: (r.height * 0.11).max(2.0) };
                     let hex = if tool == Tool::TextColor { &a.font_color } else { &a.fill_color };
-                    match cce_ui::colors::parse_hex_rgba_linear(hex) {
+                    match cce_ui::color::parse_hex_rgba_linear(hex) {
                         Some(c) => pc.quad(bar, [c[0], c[1], c[2], 1.0]),
                         // Automatic text is the label colour; no fill is an outline.
                         None if tool == Tool::TextColor => pc.quad(bar, [ink[0], ink[1], ink[2], 0.9]),
@@ -159,7 +159,7 @@ pub fn strip(pc: &mut PaintCtx, segs: &[(Rect, bool)]) {
         let inset = depth * 0.5;
         let seg = Rect { x: rect.x + inset, y: rect.y + inset, width: (rect.width - 2.0 * inset).max(0.0), height: (rect.height - 2.0 * inset).max(0.0) };
         let seg_r = (radius - inset).max(0.0);
-        pc.rounded_rect(seg, seg_r, (true, true, true, true), cce_ui::colors::PANEL_MENU_FOCUSED);
+        pc.rounded_rect(seg, seg_r, (true, true, true, true), cce_ui::color::PANEL_MENU_FOCUSED);
         if relief {
             pc.control_plate(&ControlPlate::control(seg, seg_r, PlateStance::Raised, None).with_depth(depth));
         }

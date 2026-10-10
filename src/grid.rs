@@ -99,8 +99,8 @@ impl Face {
             family,
             size,
             char_w,
-            text: cce_ui::colors::control_label_color_u8(),
-            highlight: cce_ui::colors::highlight_primary_color(),
+            text: cce_ui::color::control_label_color_u8(),
+            highlight: cce_ui::color::highlight_primary_color(),
             hair: (1.0 / scale.max(1.0)) as f32,
         }
     }
@@ -603,7 +603,7 @@ fn with_alpha(c: [f32; 4], a: f32) -> [f32; 4] {
 /// `#rrggbb` as sRGB in 0..1; `None` for anything else (an unset colour
 /// resolves to the empty string).
 fn hex_srgb(s: &str) -> Option<[f32; 3]> {
-    let b = cce_ui::colors::parse_hex_bytes(s)?;
+    let b = cce_ui::color::parse_hex_bytes(s)?;
     Some([b[0] as f32 / 255.0, b[1] as f32 / 255.0, b[2] as f32 / 255.0])
 }
 
@@ -612,7 +612,7 @@ fn to_u8(c: [f32; 3]) -> [u8; 3] {
 }
 
 fn srgb_to_linear(c: f32) -> f32 {
-    cce_ui::colors::srgb_to_linear(c)
+    cce_ui::color::srgb_to_linear(c)
 }
 
 /// Relative luminance of an sRGB colour.
