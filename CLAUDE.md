@@ -38,7 +38,12 @@ function name in a formula offers completions (Up/Down, Tab or Enter, Escape).
 Milestone 5 (done): an MCP server, so agents read and edit the workbook in
 the running window — see "MCP" below.
 
-Planned next: vault markdown tables (M6).
+Milestone 6 (done): a Markdown note opens as its tables — `cce-sheets
+note.md`, ctrl+o, or MCP `open` — one sheet per table named after the heading
+above it, header row bold and frozen, columns aligned by their delimiter
+markers; Save writes each table back over its own lines. Vault .xlsx/.csv
+files already open here from cce-notes (it hands attachments to `xdg-open`,
+and this app is the default for those types).
 
 ## Layout
 
@@ -56,6 +61,7 @@ Planned next: vault markdown tables (M6).
 | `src/format.rs` | the selected cell's formatting (`Active`) and the style writes: toggles, alignment, number formats, palette, borders |
 | `src/toolbar.rs` | toolbar layout, hit test and paint; `strip`, the recessed-strip painter the sheet tabs share |
 | `src/mcp.rs` | MCP tools (`workbook`, `read_range`, `write_cells`, `clear_range`, `format_range`, `change_lines`, `find`, `add_sheet`, `rename_sheet`, `select`, `undo`, `redo`, `save`, `open`) |
+| `src/md.rs` | GFM tables in a note: find (skipping fenced code), read cells, render, splice back in place |
 | `src/addr.rs` | A1 addresses: cells, ranges, whole columns/rows, `Sheet!` prefixes |
 | `src/functions.rs` | every function's name, GENERATED as field accessors of `language::Functions` (regenerate on an ironcalc bump) |
 
@@ -122,6 +128,15 @@ Planned next: vault markdown tables (M6).
 - `BorderArea`, like the clipboard, is built through serde (private fields,
   public `Deserialize`). Dark borders on the bare grid take the label colour,
   as text does.
+- **A note's tables are written back in place, never the note wholesale**:
+  `md::splice` re-reads the note as it is NOW and replaces only the tables'
+  lines, so prose edited elsewhere (in cce-notes, say) since opening survives;
+  if a table itself changed on disk, the save is refused and the note left as
+  it is. A table nobody changed goes back byte for byte, and a cell whose
+  content is still what the engine made of the note's text is written as the
+  note had it (`3.10` stays `3.10`, though the engine holds 3.1). Formulas are
+  written as values and added sheets are not written; the save's note says so.
+  Markdown is written only to the note the tables came from.
 - **IronCalc's `paste_csv_string` has two traps** (both met by this app):
   its reader is strict about record lengths and silently SKIPS a row shorter
   than the first — every paste goes through `clip::as_tsv`, which pads — and
@@ -167,7 +182,9 @@ and is clicked like any window; seed an external clipboard with
 `cce-shadow run sh -c 'printf … | wl-copy'`. Drive from bash, not zsh: zsh
 does not word-split a `$C`-style command variable. Never press ctrl+o,
 ctrl+shift+s or ctrl+s on an untitled book in a shadow: the portal file chooser
-opens on the LIVE display. Never run a new build on the live seat.
+opens on the LIVE display. `cce-shadow spawn` runs its command through `sh -c`, so a
+path with a space splits — open such files with the MCP `open` tool instead.
+Never run a new build on the live seat.
 
 **Installing while cce-ui is dirty** (another session's work in the tree): a
 workspace build would ship it. Build this crate alone at its pin instead —

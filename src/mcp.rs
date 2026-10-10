@@ -118,7 +118,7 @@ pub fn tools() -> Vec<McpTool> {
         ),
         tool(
             "open",
-            "Open a workbook (.xlsx, .csv, .tsv) in the window in place of the current one. Unsaved changes to the current one are kept in a recovery copy, whose path is returned.",
+            "Open a workbook (.xlsx, .csv, .tsv) in the window in place of the current one, or a Markdown note (.md), whose tables open one sheet each and `save` writes back into the note in place. Unsaved changes to the current one are kept in a recovery copy, whose path is returned.",
             json!({ "type": "object", "properties": { "path": { "type": "string", "description": "Absolute path" } }, "required": ["path"] }),
         ),
     ]

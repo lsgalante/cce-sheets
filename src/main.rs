@@ -41,6 +41,7 @@ mod format;
 mod functions;
 mod grid;
 mod mcp;
+mod md;
 mod menu;
 mod ops;
 mod toolbar;
