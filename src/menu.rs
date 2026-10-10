@@ -4,6 +4,7 @@
 //! the toolkit's fixed `ContextAction`s to a widget; this app's actions are
 //! its own.) Rows carry an action id; the choice comes back as that id.
 
+use cce_ui::process::de_bin;
 use crate::view::Hit;
 
 pub const CUT: &str = "cut";
@@ -105,15 +106,6 @@ fn layout(title: &str, rows: &[(String, String)]) -> serde_json::Value {
 fn chosen(reply: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(reply).ok()?;
     v.get("button")?.as_str().map(str::to_string)
-}
-
-/// A DE binary: beside this one (an installed set, or a workspace build's
-/// target/), else by name from PATH.
-fn de_bin(name: &str) -> std::path::PathBuf {
-    if let Some(p) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(name))).filter(|p| p.exists()) {
-        return p;
-    }
-    std::path::PathBuf::from(name)
 }
 
 #[cfg(test)]
