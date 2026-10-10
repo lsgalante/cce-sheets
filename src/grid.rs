@@ -13,7 +13,7 @@
 
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{PaintCtx, TextAttrs};
-use ironcalc::base::types::{CellType, HorizontalAlignment};
+use ironcalc::base::types::{BorderItem, BorderStyle, CellType, HorizontalAlignment};
 use ironcalc::base::UserModel;
 
 use crate::axis::Axis;
@@ -124,6 +124,11 @@ struct CellPaint {
     color: [u8; 3],
     fill: Option<[f32; 4]>,
     attrs: TextAttrs,
+    underline: bool,
+    strike: bool,
+    /// Borders drawn on this cell's edges: top, right, bottom, left, each a
+    /// weight in logical px and a colour.
+    borders: [Option<(f32, [f32; 4])>; 4],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -141,10 +146,10 @@ pub struct Selection {
     pub range: [i32; 4],
 }
 
-/// `hide`: where the in-cell editor stands. Text is drawn in a pass above
-/// every fill, so the editor's box cannot cover a value: the cells under it
-/// draw none, and overflow from either side stops at its edge.
-pub fn paint_sheet(pc: &mut PaintCtx, model: &UserModel, sheet: u32, view: &View, face: &Face, sel: &Selection, hide: Option<Rect>) {
+/// `hide`: boxes drawn over the grid — the in-cell editor, the completion
+/// list. Text is drawn in a pass above every fill, so a box cannot cover a
+/// value: the cells under one draw none, and overflow stops at its edge.
+pub fn paint_sheet(pc: &mut PaintCtx, model: &UserModel, sheet: u32, view: &View, face: &Face, sel: &Selection, hide: &[Rect]) {
     let area = view.area;
     let body = view.body();
     let cols = view.cols();
@@ -190,11 +195,14 @@ pub fn paint_sheet(pc: &mut PaintCtx, model: &UserModel, sheet: u32, view: &View
                 }
             }
         }
+        for cell in cells.iter().filter(|c| c.borders.iter().any(Option::is_some)) {
+            clipped_to_cell_band(pc, view, cell.row, cell.col, |pc| paint_borders(pc, cell));
+        }
         paint_text(pc, view, face, &cells, &col_list, hide);
         paint_cursor(pc, view, face, sel);
     });
 
-    paint_headers(pc, view, face, &row_list, &col_list, (r1, c1, r2, c2));
+    paint_headers(pc, view, face, &row_list, &col_list, (r1, c1, r2, c2), hide);
 
     // The frozen edges, across headers and cells.
     let g = view.geom;
@@ -220,9 +228,12 @@ fn collect_cells(model: &UserModel, sheet: u32, view: &View, face: &Face, rows: 
             let text = model.get_formatted_cell_value(sheet, row, col).unwrap_or_default();
             let style = m.get_style_for_cell(sheet, row, col).unwrap_or_default();
             let fill = hex_srgb(&model.resolve_color(&style.fill.color));
-            if text.is_empty() && fill.is_none() {
+            let b = &style.border;
+            let edges = [&b.top, &b.right, &b.bottom, &b.left];
+            if text.is_empty() && fill.is_none() && edges.iter().all(|e| e.is_none()) {
                 continue;
             }
+            let borders = edges.map(|e| e.as_ref().map(|item| border_ink(model, item, fill.is_some(), face)));
             let kind = model.get_cell_type(sheet, row, col).ok();
             let numeric = matches!(kind, Some(CellType::Number)) && !text.is_empty();
             let align = match style.alignment.as_ref().map(|a| &a.horizontal) {
@@ -255,13 +266,47 @@ fn collect_cells(model: &UserModel, sheet: u32, view: &View, face: &Face, rows: 
                 color,
                 fill: fill.map(|[r, g, b]| [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0]),
                 attrs: TextAttrs { italic: style.font.i, weight: style.font.b.then_some(700), ..Default::default() },
+                underline: style.font.u,
+                strike: style.font.strike,
+                borders,
             });
         }
     }
     out
 }
 
-fn paint_text(pc: &mut PaintCtx, view: &View, face: &Face, cells: &[CellPaint], cols: &[i32], hide: Option<Rect>) {
+/// A border's weight and colour as drawn. Like text, a dark border on the
+/// bare (dark) grid takes the label colour, or it would not show.
+fn border_ink(model: &UserModel, item: &BorderItem, filled: bool, face: &Face) -> (f32, [f32; 4]) {
+    let weight = match item.style {
+        BorderStyle::Medium | BorderStyle::MediumDashed | BorderStyle::MediumDashDot | BorderStyle::MediumDashDotDot => 2.0,
+        BorderStyle::Thick | BorderStyle::Double => 3.0,
+        _ => 1.0,
+    };
+    let c = hex_srgb(&model.resolve_color(&item.color)).unwrap_or([0.0, 0.0, 0.0]);
+    let c = if !filled && luma(c) < MIN_TEXT_LUMA { [face.text[0] as f32 / 255.0, face.text[1] as f32 / 255.0, face.text[2] as f32 / 255.0] } else { c };
+    (weight, [srgb_to_linear(c[0]), srgb_to_linear(c[1]), srgb_to_linear(c[2]), 1.0])
+}
+
+/// A cell's borders, centred on its edges.
+fn paint_borders(pc: &mut PaintCtx, cell: &CellPaint) {
+    let r = cell.rect;
+    let [top, right, bottom, left] = cell.borders;
+    if let Some((w, c)) = top {
+        pc.quad(Rect { x: r.x - w / 2.0, y: r.y - w / 2.0, width: r.width + w, height: w }, c);
+    }
+    if let Some((w, c)) = bottom {
+        pc.quad(Rect { x: r.x - w / 2.0, y: r.y + r.height - w / 2.0, width: r.width + w, height: w }, c);
+    }
+    if let Some((w, c)) = left {
+        pc.quad(Rect { x: r.x - w / 2.0, y: r.y - w / 2.0, width: w, height: r.height + w }, c);
+    }
+    if let Some((w, c)) = right {
+        pc.quad(Rect { x: r.x + r.width - w / 2.0, y: r.y - w / 2.0, width: w, height: r.height + w }, c);
+    }
+}
+
+fn paint_text(pc: &mut PaintCtx, view: &View, face: &Face, cells: &[CellPaint], cols: &[i32], hide: &[Rect]) {
     let filled: std::collections::HashSet<(i32, i32)> = cells.iter().filter(|c| !c.text.is_empty()).map(|c| (c.row, c.col)).collect();
     let occupied = |row: i32, col: i32| filled.contains(&(row, col));
     for cell in cells.iter().filter(|c| !c.text.is_empty()) {
@@ -311,22 +356,37 @@ fn paint_text(pc: &mut PaintCtx, view: &View, face: &Face, cells: &[CellPaint], 
         let mut clip_r = (right - CELL_PAD * 0.5).min(bx1);
         let clip_t = cell.rect.y.max(by0);
         let clip_b = (cell.rect.y + cell.rect.height).min(by1);
-        if let Some(h) = hide {
+        let mut covered = false;
+        for h in hide {
             let rows_meet = clip_t < h.y + h.height && clip_b > h.y;
             let (h0, h1) = (h.x, h.x + h.width);
             if rows_meet && clip_l < h1 && clip_r > h0 {
                 if cell.rect.x < h1 && cell.rect.x + cell.rect.width > h0 {
-                    continue;
-                }
-                if cell.rect.x < h0 {
+                    covered = true;
+                } else if cell.rect.x < h0 {
                     clip_r = clip_r.min(h0);
                 } else {
                     clip_l = clip_l.max(h1);
                 }
             }
         }
-        if clip_r <= clip_l || clip_b <= clip_t {
+        if covered || clip_r <= clip_l || clip_b <= clip_t {
             continue;
+        }
+        // Underline and strikethrough: rules across the run, in the text's
+        // colour, cut where the text is cut.
+        let rule = |pc: &mut PaintCtx, at: f32| {
+            let (x0, x1) = (x.max(clip_l), (x + width).min(clip_r));
+            if x1 > x0 && at >= clip_t && at < clip_b {
+                let [r, g, b] = cell.color.map(|v| srgb_to_linear(v as f32 / 255.0));
+                pc.quad(Rect { x: x0, y: at, width: x1 - x0, height: (face.size / 13.0).max(1.0) }, [r, g, b, 1.0]);
+            }
+        };
+        if cell.underline {
+            rule(pc, y + face.size * 1.02);
+        }
+        if cell.strike {
+            rule(pc, y + face.size * 0.55);
         }
         pc.text_attrs(text, x, y, face.size, cell.color, Some(face.family.clone()), Some([clip_l, clip_t, clip_r, clip_b]), cell.attrs);
     }
@@ -438,14 +498,19 @@ pub fn cursor_color(face: &Face) -> [f32; 4] {
 
 /// A 2px frame just inside `r`.
 pub fn frame(pc: &mut PaintCtx, r: Rect, c: [f32; 4]) {
-    let t = 2.0;
+    frame_with(pc, r, c, 2.0);
+}
+
+/// A frame `t` thick just inside `r`.
+pub fn frame_with(pc: &mut PaintCtx, r: Rect, c: [f32; 4], t: f32) {
     pc.quad(Rect { x: r.x, y: r.y, width: r.width, height: t }, c);
     pc.quad(Rect { x: r.x, y: r.y + r.height - t, width: r.width, height: t }, c);
     pc.quad(Rect { x: r.x, y: r.y, width: t, height: r.height }, c);
     pc.quad(Rect { x: r.x + r.width - t, y: r.y, width: t, height: r.height }, c);
 }
 
-fn paint_headers(pc: &mut PaintCtx, view: &View, face: &Face, rows: &[i32], cols: &[i32], range: (i32, i32, i32, i32)) {
+fn paint_headers(pc: &mut PaintCtx, view: &View, face: &Face, rows: &[i32], cols: &[i32], range: (i32, i32, i32, i32), hide: &[Rect]) {
+    let hidden = |r: Rect| hide.iter().any(|h| h.x < r.x + r.width && h.x + h.width > r.x && h.y < r.y + r.height && h.y + h.height > r.y);
     let area = view.area;
     let body = view.body();
     let (r1, c1, r2, c2) = range;
@@ -468,6 +533,9 @@ fn paint_headers(pc: &mut PaintCtx, view: &View, face: &Face, rows: &[i32], cols
                     pc.quad(cell, active);
                 }
                 pc.quad(Rect { x: x + w - face.hair, y: area.y, width: face.hair, height: view.header_h }, HEADER_LINE);
+                if hidden(cell) {
+                    return;
+                }
                 let name = column_name(c);
                 let tx = x + (w - face.text_width(&name)) / 2.0;
                 let ty = cce_ui::layout::center_text_y(area.y, view.header_h, face.size);
@@ -488,6 +556,9 @@ fn paint_headers(pc: &mut PaintCtx, view: &View, face: &Face, rows: &[i32], cols
                     pc.quad(cell, active);
                 }
                 pc.quad(Rect { x: area.x, y: y + h - face.hair, width: view.header_w, height: face.hair }, HEADER_LINE);
+                if hidden(cell) {
+                    return;
+                }
                 let label = r.to_string();
                 let tx = area.x + view.header_w - CELL_PAD * 2.0 - face.text_width(&label);
                 let ty = cce_ui::layout::center_text_y(y, h, face.size);

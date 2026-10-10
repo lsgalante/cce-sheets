@@ -15,6 +15,8 @@
 use cce_ui::cosmic_text::FontSystem;
 use cce_ui::scene::layout::Rect;
 use cce_ui::widget::{Key, KeyEvent, LineEdit, NamedKey};
+use ironcalc::base::expressions::parser::ExpectedTokens;
+use ironcalc::base::UserModel;
 
 pub struct CellEdit {
     pub edit: LineEdit,
@@ -28,17 +30,78 @@ pub struct CellEdit {
     /// How far each field's text is scrolled left to keep the caret in view.
     pub cell_shift: f32,
     pub bar_shift: f32,
+    /// Function names offered for what is typed at the caret.
+    pub completion: Option<Completion>,
+    /// Escape closed the list; it stays closed until the text changes.
+    pub completion_dismissed: Option<String>,
+}
+
+/// The function-name list under the edited formula.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub names: Vec<String>,
+    pub pick: usize,
+    /// The typed prefix's bytes in the text: `from..to` is replaced.
+    pub from: usize,
+    pub to: usize,
+}
+
+/// How many names the list shows.
+pub const COMPLETIONS: usize = 8;
+
+/// The names starting with `prefix` (any case), shortest first, at most
+/// [`COMPLETIONS`] — so `SU` offers `SUM` before `SUMPRODUCT`.
+pub fn candidates(names: &[&str], prefix: &str) -> Vec<String> {
+    let p = prefix.to_uppercase();
+    let mut out: Vec<&str> = names.iter().copied().filter(|n| n.to_uppercase().starts_with(&p)).collect();
+    out.sort_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)));
+    out.dedup();
+    out.into_iter().take(COMPLETIONS).map(str::to_string).collect()
+}
+
+/// What to offer for a formula being edited with the caret at byte
+/// `cursor`: the names a function prefix there could be, when the engine
+/// says a function name may go there. Not for plain values, an empty
+/// prefix, or a name already typed out in full.
+pub fn completion(model: &mut UserModel, sheet: u32, row: i32, col: i32, text: &str, cursor: usize, names: &[&str]) -> Option<Completion> {
+    if !text.starts_with('=') || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let chars = text[..cursor].chars().count();
+    let ctx = model.formula_completion(sheet, row, col, text, chars).ok()?;
+    let prefix = ctx.expecting.iter().find_map(|e| match e {
+        ExpectedTokens::FunctionName(p) if !p.is_empty() => Some(p.clone()),
+        _ => None,
+    })?;
+    // The prefix is what sits right before the caret.
+    let from = cursor.checked_sub(prefix.len()).filter(|&f| text.is_char_boundary(f) && text[f..cursor].eq_ignore_ascii_case(&prefix))?;
+    let names = candidates(names, &prefix);
+    if names.is_empty() || (names.len() == 1 && names[0].eq_ignore_ascii_case(&prefix)) {
+        return None;
+    }
+    Some(Completion { names, pick: 0, from, to: cursor })
+}
+
+/// `text` with the completion's prefix replaced by `name(`, and the byte the
+/// caret goes to: inside the parenthesis. An existing `(` after the caret is
+/// kept rather than doubled.
+pub fn accept(text: &str, c: &Completion, name: &str) -> (String, usize) {
+    let rest = &text[c.to..];
+    let paren = if rest.starts_with('(') { "" } else { "(" };
+    let out = format!("{}{name}{paren}{rest}", &text[..c.from]);
+    let caret = c.from + name.len() + 1;
+    (out, caret)
 }
 
 impl CellEdit {
     /// An edit of the cell's current content, caret at the end (F2, the bar).
     pub fn of_content(sheet: u32, row: i32, col: i32, content: String, in_bar: bool) -> CellEdit {
-        CellEdit { edit: LineEdit::with_text(content), sheet, row, col, typed_over: false, in_bar, cell_shift: 0.0, bar_shift: 0.0 }
+        CellEdit { edit: LineEdit::with_text(content), sheet, row, col, typed_over: false, in_bar, cell_shift: 0.0, bar_shift: 0.0, completion: None, completion_dismissed: None }
     }
 
     /// An empty edit that replaces the cell (typing over it).
     pub fn typed_over(sheet: u32, row: i32, col: i32) -> CellEdit {
-        CellEdit { edit: LineEdit::default(), sheet, row, col, typed_over: true, in_bar: false, cell_shift: 0.0, bar_shift: 0.0 }
+        CellEdit { edit: LineEdit::default(), sheet, row, col, typed_over: true, in_bar: false, cell_shift: 0.0, bar_shift: 0.0, completion: None, completion_dismissed: None }
     }
 }
 
@@ -94,6 +157,11 @@ impl Marks {
     /// The whole run's advance.
     pub fn width(&self) -> f32 {
         self.offsets.last().map_or(0.0, |&(_, x)| x)
+    }
+
+    /// The x of byte `byte` of the shown text (text-origin relative).
+    pub fn x_of(&self, byte: usize) -> f32 {
+        x_at(&self.offsets, byte)
     }
 
     /// The byte of the shown text nearest `rel_x` (text-origin relative).
@@ -172,6 +240,35 @@ mod tests {
         assert!(!types(&ctrl_c));
         assert!(!types(&key(Key::Named(NamedKey::Tab), Some("\t"))));
         assert!(!types(&key(Key::Named(NamedKey::ArrowDown), None)));
+    }
+
+    #[test]
+    fn completions_offer_functions_for_a_typed_prefix() {
+        let lang = ironcalc::base::language::get_language("en").unwrap();
+        let names = crate::functions::names(&lang.functions);
+        let mut m = UserModel::new_empty("t", "en", "UTC", "en").unwrap();
+        let text = "=A1+su";
+        let c = completion(&mut m, 0, 1, 1, text, text.len(), &names).unwrap();
+        assert_eq!(c.names[0], "SUM");
+        assert!(c.names.len() <= COMPLETIONS);
+        assert_eq!(&text[c.from..c.to], "su");
+        let (out, caret) = accept(text, &c, "SUM");
+        assert_eq!(out, "=A1+SUM(");
+        assert_eq!(caret, out.len());
+        // Not for a plain value, nor right after a complete name's "(".
+        assert_eq!(completion(&mut m, 0, 1, 1, "su", 2, &names), None);
+        assert_eq!(completion(&mut m, 0, 1, 1, "=SUM(", 5, &names), None);
+    }
+
+    #[test]
+    fn accepting_keeps_an_existing_parenthesis() {
+        let c = Completion { names: vec!["SUM".into()], pick: 0, from: 1, to: 3 };
+        assert_eq!(accept("=su(A1)", &c, "SUM"), ("=SUM(A1)".to_string(), 5));
+    }
+
+    #[test]
+    fn shorter_names_come_first() {
+        assert_eq!(candidates(&["SUMPRODUCT", "SUM", "SUMIF", "AVERAGE"], "su"), vec!["SUM", "SUMIF", "SUMPRODUCT"]);
     }
 
     #[test]

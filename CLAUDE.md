@@ -29,7 +29,13 @@ in), a dashed marquee on the copied range, the fill handle (series or copy,
 with a preview), header-edge resizing (double-click fits a column / resets a
 row), ctrl+shift+= / ctrl+- insert and delete, and a right-click menu.
 
-Planned next: formatting (M4), an MCP server (M5), vault markdown tables (M6).
+Milestone 4 (done): a formatting toolbar under the bar — number format,
+bold / italic / underline (also ctrl+b / ctrl+i / ctrl+u), alignment, text
+and fill colours, borders — drawn as ButtonStrip-style strips with cce-icons
+glyphs; the grid now draws borders, underline and strikethrough; typing a
+function name in a formula offers completions (Up/Down, Tab or Enter, Escape).
+
+Planned next: an MCP server (M5), vault markdown tables (M6).
 
 ## Layout
 
@@ -43,7 +49,10 @@ Planned next: formatting (M4), an MCP server (M5), vault markdown tables (M6).
 | `src/edit.rs` | `CellEdit` (one `LineEdit` shown in the cell and the bar), key classes, shaped caret geometry |
 | `src/clip.rs` | copy/cut/paste: IronCalc's clipboard read through serde, system clipboard vs copied cells |
 | `src/ops.rs` | insert/delete rows and columns, fill-handle reach and fill, fitting a column |
-| `src/menu.rs` | the right-click menu as a `cce-cloud --json` popup |
+| `src/menu.rs` | `cce-cloud --json` popups: the right-click menu and the toolbar's format/colour/border menus |
+| `src/format.rs` | the selected cell's formatting (`Active`) and the style writes: toggles, alignment, number formats, palette, borders |
+| `src/toolbar.rs` | toolbar layout, hit test and paint; `strip`, the recessed-strip painter the sheet tabs share |
+| `src/functions.rs` | every function's name, GENERATED as field accessors of `language::Functions` (regenerate on an ironcalc bump) |
 
 ## Rules
 
@@ -93,6 +102,21 @@ Planned next: formatting (M4), an MCP server (M5), vault markdown tables (M6).
 - A resize previews by swapping in `Axis::with_size` and writes once on release
   (one undo step), to every selected whole column/row when the dragged one is
   among them.
+- **Glyphs come from cce-icons** (`bold`, `italic`, `underline`,
+  `align-left/center/right`, `fill`, `borders`, plus `font`, `chevron-down`) —
+  never letters in a fallback font. The app icon is `table.svg`
+  (`hicolor/scalable/apps/cce-sheets.svg`).
+- **Anything drawn over text must hide that text**: the editor and the
+  completion list are passed to `paint_sheet(.., hide)` (cells and header
+  labels under them draw no text) and to `toolbar::paint`. A box alone cannot
+  cover text — the glyph pass is above every fill.
+- **Function names for completion are IronCalc's own** (`language::Functions`
+  fields): its function table is private. `every_name_is_a_function_the_engine_knows`
+  fails if one stops parsing; a function IronCalc adds is missed until
+  `functions.rs` is regenerated from its `language/mod.rs`.
+- `BorderArea`, like the clipboard, is built through serde (private fields,
+  public `Deserialize`). Dark borders on the bare grid take the label colour,
+  as text does.
 - Model strings borrow for the model's life (`Model<'a>`): construct with the
   `'static` constants in `book.rs`, then rename.
 
@@ -126,5 +150,5 @@ private `CARGO_TARGET_DIR`, then `install -m755 … ~/.local/bin/cce-sheets.new 
 mv` (the desktop entry is ccebuild's; reinstall it with `ccebuild install
 --no-build cce-sheets` only from a clean-tree build).
 
-Not done yet: the app icon (`cce-icons/hicolor`), merged cells, wrapped text,
-borders, conditional formatting, ODS.
+Not done yet: merged cells, wrapped text and vertical alignment, per-cell font
+sizes and faces (every cell is the DE label font), conditional formatting, ODS.

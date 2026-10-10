@@ -20,6 +20,11 @@
 //! resize, and a double-click on one fits it. A right-click opens the cell or
 //! header menu.
 //!
+//! The toolbar under the bar sets the number format, bold / italic /
+//! underline (also ctrl+b / ctrl+i / ctrl+u), alignment, text and fill
+//! colours and borders on the selection. Typing a function name in a formula
+//! offers completions: Up/Down pick, Tab or Enter takes one, Escape closes.
+//!
 //! Closing with unsaved changes keeps them: `on_exit` writes a recovery copy
 //! under `$XDG_STATE_HOME/cce-sheets/recovered/` (the toolkit has no way to
 //! ask before a window closes).
@@ -28,9 +33,12 @@ mod axis;
 mod book;
 mod clip;
 mod edit;
+mod format;
+mod functions;
 mod grid;
 mod menu;
 mod ops;
+mod toolbar;
 mod view;
 
 use std::collections::HashMap;
@@ -39,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use cce_ui::engine::{AppSender, Application, CursorIcon, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::scene::layout::Rect;
-use cce_ui::scene::paint::{ControlPlate, DisplayList, PaintCtx, PlateStance};
+use cce_ui::scene::paint::{DisplayList, PaintCtx};
 use cce_ui::scene::Material;
 use cce_ui::widget::scroll_motion::{Bounds, ScrollMotion};
 use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
@@ -49,6 +57,7 @@ use ironcalc::base::worksheet::NavigationDirection;
 use book::{column_name, Book, SHEET_EXTS};
 use edit::{CellEdit, EditKey, Marks};
 use ops::{FillTo, Line};
+use toolbar::Tool;
 use grid::{dim, Face, Selection};
 use view::{Hit, SheetGeom, View};
 
@@ -95,13 +104,17 @@ struct Frame {
     editor: Option<Rect>,
     /// The fill handle, when the selection's corner is on screen.
     fill_handle: Option<Rect>,
+    /// The formatting toolbar's groups.
+    tools: Vec<Vec<(Rect, Tool)>>,
+    /// The completion list under the edited formula, and its row height.
+    popover: Option<(Rect, f32)>,
 }
 
 const NO_RECT: Rect = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
 
 impl Default for Frame {
     fn default() -> Self {
-        Frame { address: NO_RECT, content: NO_RECT, well: NO_RECT, area: NO_RECT, header_w: 0.0, header_h: 0.0, tabs: Vec::new(), editor: None, fill_handle: None }
+        Frame { address: NO_RECT, content: NO_RECT, well: NO_RECT, area: NO_RECT, header_w: 0.0, header_h: 0.0, tabs: Vec::new(), editor: None, fill_handle: None, tools: Vec::new(), popover: None }
     }
 }
 
@@ -131,6 +144,8 @@ struct SheetsApp {
     last_press: Option<(Instant, i32, i32)>,
     /// Shapes the edited text for its caret and click positions.
     font_system: cce_ui::cosmic_text::FontSystem,
+    /// Every worksheet function's name, for formula completion.
+    func_names: Vec<&'static str>,
     /// The selected sheet's measurements; rebuilt when the sheet changes.
     geom: SheetGeom,
     geom_sheet: u32,
@@ -165,6 +180,7 @@ impl SheetsApp {
             edit_drag: false,
             last_press: None,
             font_system,
+            func_names: ironcalc::base::language::get_language(book::LANGUAGE).map(|l| functions::names(&l.functions)).unwrap_or_default(),
             geom,
             geom_sheet: sheet,
             scroll: (0.0, 0.0),
@@ -485,7 +501,9 @@ impl SheetsApp {
             x += tw;
         }
 
-        let well_y = inset + BAR_H + gap;
+        let tools_y = inset + BAR_H + gap;
+        let tools = toolbar::layout(inset, tools_y, BAR_H, face.char_w, cgap * 2.0);
+        let well_y = tools_y + BAR_H + gap;
         let well = Rect { x: inset, y: well_y, width: inner_w, height: (tabs_y - gap - well_y).max(0.0) };
         // The cells run to the well's edge and slide under its rim.
         let rim = cce_ui::layout::bevel_width().min(well.height * 0.2) * 0.5;
@@ -499,7 +517,7 @@ impl SheetsApp {
             let v = View { geom: &self.geom, area, header_w, header_h, scroll: self.scroll };
             header_w = grid::row_header_width(face, v.rows().last);
         }
-        self.frame = Frame { address, content, well, area, header_w, header_h, tabs, editor: None, fill_handle: None };
+        self.frame = Frame { address, content, well, area, header_w, header_h, tabs, editor: None, fill_handle: None, tools, popover: None };
     }
 
     fn select_hit(&mut self, hit: Hit, extend: bool) -> bool {
@@ -684,6 +702,12 @@ impl SheetsApp {
     /// comes back as [`Message::Menu`].
     fn open_menu(&mut self, hit: Hit) {
         let entries = menu::entries(hit, self.copied.is_some() || cce_ui::widget::clipboard::read_from_clipboard().is_some());
+        self.open_menu_with(entries);
+    }
+
+    /// Show `entries` at the pointer on a thread; the choice comes back as
+    /// [`Message::Menu`].
+    fn open_menu_with(&mut self, entries: menu::Menu) {
         if entries.1.is_empty() {
             return;
         }
@@ -710,6 +734,27 @@ impl SheetsApp {
             menu::FIT_COLS => {
                 let [_, c1, _, c2] = ops::normalized(self.selection().range);
                 self.autofit(c1, c2);
+            }
+            id if id.starts_with("font-color:") || id.starts_with("fill-color:") => {
+                let (key, hex) = id.split_once(':').expect("matched a colon");
+                let path = if key == "font-color" { "font.color" } else { "fill.color" };
+                let (sheet, range) = (self.sheet(), self.selection().range);
+                let r = format::set(&mut self.book.model, sheet, range, path, hex);
+                self.styled(r);
+            }
+            id if id.starts_with("fmt-") => {
+                if let Some((_, _, code)) = format::NUMBER_FORMATS.iter().find(|(f, _, _)| *f == id) {
+                    let (sheet, range) = (self.sheet(), self.selection().range);
+                    let r = format::set(&mut self.book.model, sheet, range, "num_fmt", code);
+                    self.styled(r);
+                }
+            }
+            id if id.starts_with("border-") => {
+                if let Some((_, _, kind)) = format::BORDERS.iter().find(|(b, _, _)| *b == id) {
+                    let (sheet, range) = (self.sheet(), self.selection().range);
+                    let r = format::borders(&mut self.book.model, sheet, range, kind);
+                    self.styled(r);
+                }
             }
             other => log::warn!("unknown menu action {other:?}"),
         }
@@ -824,39 +869,111 @@ impl SheetsApp {
     /// The sheet tabs as a ButtonStrip draws its recessed style: one well
     /// carved around the run, the selected tab a plateau raised back out of
     /// its floor; flat, the selected tab is a fill.
+    /// The sheet tabs: a strip whose selected segment is the shown sheet.
     fn paint_tabs(&self, pc: &mut PaintCtx, face: &Face) {
-        let (Some((first, _)), Some((last, _))) = (self.frame.tabs.first(), self.frame.tabs.last()) else {
-            return;
-        };
-        let strip = Rect { x: first.x, y: first.y, width: last.x + last.width - first.x, height: first.height };
-        let radius = cce_ui::layout::button_corner_radius();
-        let relief = cce_ui::layout::control_relief();
-        let depth = if relief {
-            let depth = cce_ui::layout::bevel_width().min(strip.height * 0.2);
-            let (well, radii) = cce_ui::layout::carve_inside(strip, (radius, radius, radius, radius), depth);
-            pc.recess(well, radii, depth);
-            depth
-        } else {
-            0.0
-        };
         let cur = self.sheet();
+        let segs: Vec<(Rect, bool)> = self.frame.tabs.iter().map(|&(r, i)| (r, i == cur)).collect();
+        toolbar::strip(pc, &segs);
         let text_in = cce_ui::layout::CONTROL_TEXT_INSET;
         let names: HashMap<u32, String> = self.visible_sheets().into_iter().collect();
         for (rect, i) in &self.frame.tabs {
-            let selected = *i == cur;
-            let inset = depth * 0.5;
-            let seg = Rect { x: rect.x + inset, y: rect.y + inset, width: (rect.width - 2.0 * inset).max(0.0), height: (rect.height - 2.0 * inset).max(0.0) };
-            let seg_r = (radius - inset).max(0.0);
-            if selected {
-                pc.rounded_rect(seg, seg_r, (true, true, true, true), cce_ui::colors::PANEL_MENU_FOCUSED);
-                if relief {
-                    pc.control_plate(&ControlPlate::control(seg, seg_r, PlateStance::Raised, None).with_depth(depth));
-                }
-            }
             let ty = cce_ui::layout::center_text_y(rect.y, rect.height, face.size);
-            let color = if selected { face.text } else { dim(face.text) };
+            let color = if *i == cur { face.text } else { dim(face.text) };
             let name = names.get(i).cloned().unwrap_or_default();
             pc.text_with(name, rect.x + text_in, ty, face.size, color, Some(face.family.clone()), None);
+        }
+    }
+
+    /// The completion list: names under the formula, the picked one lit.
+    fn paint_popover(&self, pc: &mut PaintCtx, face: &Face) {
+        let (Some((r, row_h)), Some(c)) = (self.frame.popover, self.editing.as_ref().and_then(|e| e.completion.as_ref())) else {
+            return;
+        };
+        let text_in = cce_ui::layout::CONTROL_TEXT_INSET;
+        pc.quad(r, EDITOR_FILL);
+        grid::frame_with(pc, r, [1.0, 1.0, 1.0, 0.22], 1.0);
+        for (i, name) in c.names.iter().enumerate() {
+            let row = Rect { x: r.x + 2.0, y: r.y + 2.0 + i as f32 * row_h, width: r.width - 4.0, height: row_h };
+            if i == c.pick {
+                let h = face.highlight;
+                pc.quad(row, [h[0], h[1], h[2], 0.45]);
+            }
+            let ty = cce_ui::layout::center_text_y(row.y, row.height, face.size);
+            pc.text_with(name.clone(), row.x + text_in, ty, face.size, face.text, Some(face.family.clone()), None);
+        }
+    }
+
+    /// Re-read what the edited formula could complete to, keeping the pick
+    /// while the list is the same.
+    fn refresh_completion(&mut self) {
+        let Some(ed) = self.editing.as_ref() else {
+            return;
+        };
+        let text = ed.edit.text.clone();
+        let (sheet, row, col, cursor) = (ed.sheet, ed.row, ed.col, ed.edit.cursor);
+        let quiet = ed.completion_dismissed.as_deref() == Some(text.as_str()) || ed.edit.selection.is_some();
+        let fresh = if quiet { None } else { edit::completion(&mut self.book.model, sheet, row, col, &text, cursor, &self.func_names) };
+        let ed = self.editing.as_mut().expect("checked above");
+        ed.completion = match (ed.completion.take(), fresh) {
+            (Some(old), Some(new)) if old.names == new.names => Some(edit::Completion { pick: old.pick, ..new }),
+            (_, new) => new,
+        };
+    }
+
+    /// Take completion `i`: the typed prefix becomes the name and `(`.
+    fn accept_completion(&mut self, i: usize) {
+        let Some(ed) = self.editing.as_mut() else {
+            return;
+        };
+        let Some(c) = ed.completion.take() else {
+            return;
+        };
+        let Some(name) = c.names.get(i) else {
+            return;
+        };
+        let (text, caret) = edit::accept(&ed.edit.text, &c, name);
+        ed.edit.text = text;
+        ed.edit.cursor = caret;
+        ed.edit.selection = None;
+    }
+
+    /// A toolbar press: a toggle or alignment acts at once; the format,
+    /// colour and border tools open their menus.
+    fn press_tool(&mut self, tool: Tool) {
+        let sheet = self.sheet();
+        let sel = self.selection();
+        let a = format::active(&self.book.model, sheet, sel.row, sel.col);
+        let m = &mut self.book.model;
+        let r = match tool {
+            Tool::Bold => format::toggle(m, sheet, sel.range, "font.b", a.bold),
+            Tool::Italic => format::toggle(m, sheet, sel.range, "font.i", a.italic),
+            Tool::Underline => format::toggle(m, sheet, sel.range, "font.u", a.underline),
+            Tool::AlignLeft => format::align(m, sheet, sel.range, format::Align::Left, a.align),
+            Tool::AlignCenter => format::align(m, sheet, sel.range, format::Align::Center, a.align),
+            Tool::AlignRight => format::align(m, sheet, sel.range, format::Align::Right, a.align),
+            Tool::Format => {
+                let rows: Vec<(&str, &str)> = format::NUMBER_FORMATS.iter().map(|(id, label, _)| (*id, *label)).collect();
+                return self.open_menu_with(menu::of("Number format", &rows));
+            }
+            Tool::TextColor | Tool::FillColor => {
+                let (key, title, none) = if tool == Tool::TextColor { ("font-color:", "Text colour", "Automatic") } else { ("fill-color:", "Fill colour", "No fill") };
+                let mut rows = vec![(key.to_string(), none.to_string())];
+                rows.extend(format::PALETTE.iter().map(|(name, hex)| (format!("{key}{hex}"), name.to_string())));
+                return self.open_menu_with((title.to_string(), rows));
+            }
+            Tool::Borders => {
+                let rows: Vec<(&str, &str)> = format::BORDERS.iter().map(|(id, label, _)| (*id, *label)).collect();
+                return self.open_menu_with(menu::of("Borders", &rows));
+            }
+        };
+        self.styled(r);
+    }
+
+    /// After a style change: unsaved and repainted, or the reason shown.
+    fn styled(&mut self, r: Result<(), String>) {
+        match r {
+            Ok(()) => self.changed(),
+            Err(e) => self.set_status(e, true),
         }
     }
 }
@@ -1015,6 +1132,19 @@ impl Application for SheetsApp {
         }
         *needs_rebuild = true;
         let (x, y) = (pos.x, pos.y);
+        // A completion row takes that name.
+        if let Some((r, row_h)) = self.frame.popover.filter(|(r, _)| contains(r, x, y)) {
+            let i = ((y - r.y - 2.0) / row_h).floor().max(0.0) as usize;
+            self.accept_completion(i);
+            return None;
+        }
+        // A toolbar tool applies to the selection, an open edit kept first.
+        if let Some(tool) = toolbar::hit(&self.frame.tools, x, y) {
+            if self.commit_edit() {
+                self.press_tool(tool);
+            }
+            return None;
+        }
         // A press in the field being edited, or in the bar: the caret goes there.
         let in_editor = self.frame.editor.is_some_and(|r| contains(&r, x, y));
         let in_bar = contains(&self.frame.content, x, y);
@@ -1115,6 +1245,33 @@ impl Application for SheetsApp {
                 }
             }
         }
+        // The completion list, while it shows, has the keys that move in it.
+        if let Some(c) = self.editing.as_ref().and_then(|e| e.completion.as_ref()) {
+            let n = c.names.len();
+            let pick = c.pick;
+            let took = match &event.logical_key {
+                Key::Named(NamedKey::ArrowDown) => Some(Some((pick + 1) % n)),
+                Key::Named(NamedKey::ArrowUp) => Some(Some((pick + n - 1) % n)),
+                Key::Named(NamedKey::Tab | NamedKey::Enter) => {
+                    self.accept_completion(pick);
+                    Some(None)
+                }
+                Key::Named(NamedKey::Escape) => {
+                    let ed = self.editing.as_mut().expect("has a completion");
+                    ed.completion_dismissed = Some(ed.edit.text.clone());
+                    ed.completion = None;
+                    Some(None)
+                }
+                _ => None,
+            };
+            if let Some(next) = took {
+                if let (Some(p), Some(c)) = (next, self.editing.as_mut().and_then(|e| e.completion.as_mut())) {
+                    c.pick = p;
+                }
+                *needs_rebuild = true;
+                return None;
+            }
+        }
         if let Some(ed) = self.editing.as_mut() {
             match edit::classify(ed, event) {
                 EditKey::Cancel => {
@@ -1127,6 +1284,7 @@ impl Application for SheetsApp {
                 }
                 EditKey::Field => {
                     ed.edit.handle_key(event);
+                    self.refresh_completion();
                 }
             }
             *needs_rebuild = true;
@@ -1143,6 +1301,9 @@ impl Application for SheetsApp {
                 CellChord::Paste => self.paste(),
                 CellChord::Insert => self.structure(line, true, false),
                 CellChord::Delete => self.structure(line, false, false),
+                CellChord::Bold => self.press_tool(Tool::Bold),
+                CellChord::Italic => self.press_tool(Tool::Italic),
+                CellChord::Underline => self.press_tool(Tool::Underline),
             }
             *needs_rebuild = true;
             return None;
@@ -1259,6 +1420,32 @@ impl Application for SheetsApp {
             }
             ed.bar_shift = edit::keep_caret(ed.bar_shift, m.caret, m.width(), self.frame.content.width - 2.0 * text_in);
         }
+        // The completion list hangs under the typed prefix, in the bar or
+        // under the in-cell editor, whichever has the caret.
+        self.refresh_completion();
+        if let (Some(m), Some(ed)) = (&marks, &self.editing) {
+            if let Some(c) = &ed.completion {
+                let text_in = cce_ui::layout::CONTROL_TEXT_INSET;
+                // (text origin x, the field's top, its bottom)
+                let anchor = if ed.in_bar {
+                    let b = self.frame.content;
+                    Some((b.x + text_in - ed.bar_shift, b.y, b.y + b.height))
+                } else {
+                    self.frame.editor.map(|r| (r.x + grid::CELL_PAD - ed.cell_shift, r.y, r.y + r.height))
+                };
+                if let Some((x0, top, bottom)) = anchor {
+                    let row_h = (face.size + 10.0).max(20.0);
+                    let widest = c.names.iter().map(|n| n.chars().count()).max().unwrap_or(4) as f32;
+                    let w = widest * face.char_w + 2.0 * text_in + 4.0;
+                    let h = c.names.len() as f32 * row_h + 4.0;
+                    let x = (x0 + m.x_of(ed.edit.display_index(c.from)) - text_in).clamp(0.0, (size.width - w).max(0.0));
+                    // Below the field, or above it where below would leave the window.
+                    let room = size.height - cce_ui::layout::root_plate_inset();
+                    let y = if bottom + 2.0 + h > room && top - 2.0 - h >= 0.0 { top - 2.0 - h } else { bottom + 2.0 };
+                    self.frame.popover = Some((Rect { x, y, width: w, height: h }, row_h));
+                }
+            }
+        }
 
         // The fill handle sits on the selection's bottom-right corner, when
         // that corner is on screen and nothing is being edited.
@@ -1288,15 +1475,19 @@ impl Application for SheetsApp {
         let mut pc = PaintCtx::new();
         pc.root_plate(size.width, size.height);
         self.paint_bar(&mut pc, &face, marks.as_ref());
+        let sel = self.selection();
+        let active = format::active(&self.book.model, self.sheet(), sel.row, sel.col);
+        let popover = self.frame.popover.map(|(r, _)| r);
+        toolbar::paint(&mut pc, &self.frame.tools, &active, &face, popover);
 
         let well = self.frame.well;
         let radius = cce_ui::layout::plate_corner_radius();
         let relief = cce_ui::layout::control_relief();
         pc.well_floor(well, radius, &Material::root(), false);
-        let sel = self.selection();
         let sheet = self.sheet();
+        let hide: Vec<Rect> = self.frame.editor.into_iter().chain(popover).collect();
         pc.clip_rounded(well, radius, |pc| {
-            grid::paint_sheet(pc, &self.book.model, sheet, &self.view(), &face, &sel, self.frame.editor);
+            grid::paint_sheet(pc, &self.book.model, sheet, &self.view(), &face, &sel, &hide);
             grid::paint_overlay(pc, &self.view(), &face, &overlay);
             if let Some(m) = &marks {
                 self.paint_editor(pc, &face, m);
@@ -1305,6 +1496,7 @@ impl Application for SheetsApp {
         pc.well_rim(well, radius, relief);
 
         self.paint_tabs(&mut pc, &face);
+        self.paint_popover(&mut pc, &face);
         if let Some(status) = &self.status {
             let x = self.frame.tabs.last().map_or(self.frame.well.x, |(r, _)| r.x + r.width + cce_ui::layout::control_gap() * 2.0);
             let y = self.frame.tabs.first().map_or(self.frame.well.y, |(r, _)| cce_ui::layout::center_text_y(r.y, r.height, face.size));
@@ -1362,6 +1554,9 @@ enum CellChord {
     Insert,
     /// ctrl+-: delete them.
     Delete,
+    Bold,
+    Italic,
+    Underline,
 }
 
 fn cell_chord(event: &KeyEvent) -> Option<CellChord> {
@@ -1378,6 +1573,9 @@ fn cell_chord(event: &KeyEvent) -> Option<CellChord> {
         "+" => CellChord::Insert,
         "=" if event.shift => CellChord::Insert,
         "-" => CellChord::Delete,
+        "b" => CellChord::Bold,
+        "i" => CellChord::Italic,
+        "u" => CellChord::Underline,
         _ => return None,
     })
 }
