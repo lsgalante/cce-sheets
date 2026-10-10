@@ -5,7 +5,7 @@ edition = "2021"
 description = "Spreadsheets for the cce desktop: Excel-compatible workbooks on the IronCalc engine"
 
 [dependencies]
-cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "e9b11601bd49b685ecc3e2e594c044bd48a08dfd" }
+cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "45c5ed027a64fa7072c82021168ed4383b03ba42" }
 # The spreadsheet engine: cells, formulas, styles, selection and undo, plus
 # .xlsx import/export (MIT OR Apache-2.0).
 ironcalc = "0.8.3"
