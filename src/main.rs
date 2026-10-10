@@ -13,21 +13,31 @@
 //! for horizontal); press, drag and shift+press select; header presses select
 //! a whole column or row; a double-click edits.
 //!
+//! ctrl+c / ctrl+x / ctrl+v copy, cut and paste cells (formulas shift; text
+//! from other apps pastes as tab-separated values); ctrl+shift+= and ctrl+-
+//! insert and delete rows (columns for a whole-column selection). The square
+//! at the selection's corner fills (a series where one shows); header edges
+//! resize, and a double-click on one fits it. A right-click opens the cell or
+//! header menu.
+//!
 //! Closing with unsaved changes keeps them: `on_exit` writes a recovery copy
 //! under `$XDG_STATE_HOME/cce-sheets/recovered/` (the toolkit has no way to
 //! ask before a window closes).
 
 mod axis;
 mod book;
+mod clip;
 mod edit;
 mod grid;
+mod menu;
+mod ops;
 mod view;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
+use cce_ui::engine::{AppSender, Application, CursorIcon, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{ControlPlate, DisplayList, PaintCtx, PlateStance};
 use cce_ui::scene::Material;
@@ -38,6 +48,7 @@ use ironcalc::base::worksheet::NavigationDirection;
 
 use book::{column_name, Book, SHEET_EXTS};
 use edit::{CellEdit, EditKey, Marks};
+use ops::{FillTo, Line};
 use grid::{dim, Face, Selection};
 use view::{Hit, SheetGeom, View};
 
@@ -48,7 +59,25 @@ const BAR_H: f32 = 28.0;
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 #[derive(Debug, Clone)]
-enum Message {}
+enum Message {
+    /// A row chosen in the right-click menu, by its id.
+    Menu(String),
+}
+
+/// A header edge being dragged: the column or row, where the drag began,
+/// its size then and now, and the axis as it was (the preview is drawn from
+/// it with the new size).
+struct Resize {
+    line: Line,
+    index: i32,
+    origin: f32,
+    start: f64,
+    size: f64,
+    base: axis::Axis,
+}
+
+/// Side of the fill handle, the square at the selection's corner.
+const FILL_HANDLE: f32 = 7.0;
 
 /// Where everything sits in the window, from the last frame; input hit-tests
 /// against this.
@@ -64,13 +93,15 @@ struct Frame {
     tabs: Vec<(Rect, u32)>,
     /// The in-cell editor's box while a cell is edited in place.
     editor: Option<Rect>,
+    /// The fill handle, when the selection's corner is on screen.
+    fill_handle: Option<Rect>,
 }
 
 const NO_RECT: Rect = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
 
 impl Default for Frame {
     fn default() -> Self {
-        Frame { address: NO_RECT, content: NO_RECT, well: NO_RECT, area: NO_RECT, header_w: 0.0, header_h: 0.0, tabs: Vec::new(), editor: None }
+        Frame { address: NO_RECT, content: NO_RECT, well: NO_RECT, area: NO_RECT, header_w: 0.0, header_h: 0.0, tabs: Vec::new(), editor: None, fill_handle: None }
     }
 }
 
@@ -81,7 +112,15 @@ struct Status {
 }
 
 struct SheetsApp {
+    sender: AppSender<Message>,
     book: Book,
+    /// Cells copied or cut here, until pasted (a cut) or let go (Escape).
+    copied: Option<clip::Copied>,
+    resize: Option<Resize>,
+    /// A fill-handle drag, and where it reaches so far.
+    fill: Option<Option<FillTo>>,
+    /// The last press on a header edge, for telling a double-click.
+    last_edge_press: Option<(Instant, Hit)>,
     status: Option<Status>,
     /// Changes since the last save.
     dirty: bool,
@@ -110,11 +149,16 @@ struct SheetsApp {
 }
 
 impl SheetsApp {
-    fn with_book(book: Book, error: Option<String>, font_system: cce_ui::cosmic_text::FontSystem) -> Self {
+    fn with_book(book: Book, error: Option<String>, font_system: cce_ui::cosmic_text::FontSystem, sender: AppSender<Message>) -> Self {
         let sheet = book.model.get_selected_sheet();
         let geom = grid::sheet_geom(&book.model, sheet);
         SheetsApp {
+            sender,
             book,
+            copied: None,
+            resize: None,
+            fill: None,
+            last_edge_press: None,
             status: error.map(|text| Status { text, error: true }),
             dirty: false,
             editing: None,
@@ -153,6 +197,7 @@ impl SheetsApp {
         self.geom = grid::sheet_geom(&book.model, sheet);
         self.geom_sheet = sheet;
         self.book = book;
+        self.copied = None;
         self.status = None;
         self.dirty = false;
         self.last_press = None;
@@ -454,7 +499,7 @@ impl SheetsApp {
             let v = View { geom: &self.geom, area, header_w, header_h, scroll: self.scroll };
             header_w = grid::row_header_width(face, v.rows().last);
         }
-        self.frame = Frame { address, content, well, area, header_w, header_h, tabs, editor: None };
+        self.frame = Frame { address, content, well, area, header_w, header_h, tabs, editor: None, fill_handle: None };
     }
 
     fn select_hit(&mut self, hit: Hit, extend: bool) -> bool {
@@ -467,9 +512,207 @@ impl SheetsApp {
             Hit::ColHeader(col) => m.set_selected_cell(1, col).and_then(|_| m.set_selected_range(1, col, last_row, col)),
             Hit::RowHeader(row) => m.set_selected_cell(row, 1).and_then(|_| m.set_selected_range(row, 1, row, last_col)),
             Hit::Corner => m.set_selected_cell(1, 1).and_then(|_| m.set_selected_range(1, 1, last_row, last_col)),
-            Hit::Outside => return false,
+            Hit::Outside | Hit::ColEdge(_) | Hit::RowEdge(_) => return false,
         };
         done.is_ok()
+    }
+
+    // ---- clipboard, structure, fill, resize ----
+
+    fn copy(&mut self, cut: bool) {
+        match clip::copy(&self.book.model, cut) {
+            Ok(c) => {
+                cce_ui::widget::clipboard::copy_to_clipboard(&c.text);
+                self.copied = Some(c);
+            }
+            Err(e) => self.set_status(e, true),
+        }
+    }
+
+    fn paste(&mut self) {
+        let system = cce_ui::widget::clipboard::read_from_clipboard();
+        let result = match clip::source(self.copied.as_ref(), system) {
+            clip::Source::Cells => {
+                let c = self.copied.as_ref().expect("source said cells");
+                let r = clip::paste_cells(&mut self.book.model, c);
+                // A cut moves once; its source is empty now.
+                if c.cut {
+                    self.copied = None;
+                }
+                r
+            }
+            clip::Source::Text(t) => clip::paste_text(&mut self.book.model, &t),
+            clip::Source::Nothing => return,
+        };
+        match result {
+            Ok(()) => {
+                self.changed();
+                self.reveal_selection();
+            }
+            Err(e) => self.set_status(e, true),
+        }
+    }
+
+    /// Insert (or, with `insert` false, delete) rows or columns at the selection.
+    fn structure(&mut self, line: Line, insert: bool, after: bool) {
+        let sheet = self.sheet();
+        let range = self.selection().range;
+        let used = grid::used_extent(&self.book.model, sheet);
+        let r = if insert {
+            ops::insert(&mut self.book.model, sheet, range, line, after, used)
+        } else {
+            ops::delete(&mut self.book.model, sheet, range, line, used)
+        };
+        match r {
+            Ok(()) => {
+                // Copied ranges no longer name the cells they did.
+                self.copied = None;
+                self.changed();
+            }
+            Err(e) => self.set_status(e, true),
+        }
+    }
+
+    /// Fit each selected column to its widest value (a double-click on its
+    /// header edge, or the menu).
+    fn autofit(&mut self, c1: i32, c2: i32) {
+        let Some(face) = self.face.clone() else {
+            return;
+        };
+        let sheet = self.sheet();
+        let (_, used_c) = grid::used_extent(&self.book.model, sheet);
+        let default = self.geom.cols.size(grid::LAST_COLUMN);
+        let mut any = false;
+        for c in c1..=c2.min(used_c.max(c1)) {
+            let widths = ops::column_texts(&self.book.model, sheet, c).iter().map(|t| face.text_width(t)).collect::<Vec<_>>();
+            let w = ops::fit_width(widths, grid::CELL_PAD).unwrap_or(default);
+            any |= self.book.model.set_columns_width(sheet, c, c, w).is_ok();
+        }
+        if any {
+            self.changed();
+        }
+    }
+
+    /// A press on a header edge: a double-click fits the column (or puts the
+    /// row back to the default height); a single press starts a resize.
+    fn press_edge(&mut self, hit: Hit, x: f32, y: f32) {
+        let now = Instant::now();
+        let double = self.last_edge_press.is_some_and(|(t, h)| h == hit && now.duration_since(t) < DOUBLE_CLICK);
+        self.last_edge_press = if double { None } else { Some((now, hit)) };
+        let sheet = self.sheet();
+        match (hit, double) {
+            (Hit::ColEdge(c), true) => self.autofit(c, c),
+            (Hit::RowEdge(r), true) => {
+                let h = self.geom.rows.size(grid::LAST_ROW);
+                if self.book.model.set_rows_height(sheet, r, r, h).is_ok() {
+                    self.changed();
+                }
+            }
+            (Hit::ColEdge(c), false) => {
+                let s = self.geom.cols.size(c);
+                self.resize = Some(Resize { line: Line::Cols, index: c, origin: x, start: s, size: s, base: self.geom.cols.clone() });
+            }
+            (Hit::RowEdge(r), false) => {
+                let s = self.geom.rows.size(r);
+                self.resize = Some(Resize { line: Line::Rows, index: r, origin: y, start: s, size: s, base: self.geom.rows.clone() });
+            }
+            _ => {}
+        }
+    }
+
+    /// The resize drag moved: preview the new size.
+    fn drag_resize(&mut self, x: f32, y: f32) {
+        let Some(rz) = self.resize.as_mut() else {
+            return;
+        };
+        let d = match rz.line {
+            Line::Cols => x - rz.origin,
+            Line::Rows => y - rz.origin,
+        };
+        rz.size = (rz.start + d as f64).max(4.0);
+        match rz.line {
+            Line::Cols => self.geom.cols = rz.base.with_size(rz.index, rz.size),
+            Line::Rows => self.geom.rows = rz.base.with_size(rz.index, rz.size),
+        }
+    }
+
+    /// The resize drag ended: write the size — to every selected whole
+    /// column (or row) when the dragged one is among them, as Excel does.
+    fn end_resize(&mut self) {
+        let Some(rz) = self.resize.take() else {
+            return;
+        };
+        if rz.size == rz.start {
+            return;
+        }
+        let sheet = self.sheet();
+        let [r1, c1, r2, c2] = ops::normalized(self.selection().range);
+        let range = [r1, c1, r2, c2];
+        let r = match rz.line {
+            Line::Cols if ops::whole_cols(range) && (c1..=c2).contains(&rz.index) => self.book.model.set_columns_width(sheet, c1, c2, rz.size),
+            Line::Cols => self.book.model.set_columns_width(sheet, rz.index, rz.index, rz.size),
+            Line::Rows if ops::whole_rows(range) && (r1..=r2).contains(&rz.index) => self.book.model.set_rows_height(sheet, r1, r2, rz.size),
+            Line::Rows => self.book.model.set_rows_height(sheet, rz.index, rz.index, rz.size),
+        };
+        match r {
+            Ok(()) => self.changed(),
+            Err(e) => self.set_status(e, true),
+        }
+    }
+
+    /// The fill drag ended: fill to where it reached, and select the result.
+    fn end_fill(&mut self) {
+        let Some(Some(to)) = self.fill.take() else {
+            return;
+        };
+        let sheet = self.sheet();
+        let range = self.selection().range;
+        match ops::fill(&mut self.book.model, sheet, range, to) {
+            Ok(()) => {
+                let [r1, c1, r2, c2] = ops::filled_range(range, to);
+                let sel = self.selection();
+                let _ = self.book.model.set_selected_range(r1, c1, r2, c2).or_else(|_| {
+                    self.book.model.set_selected_cell(sel.row, sel.col)
+                });
+                self.changed();
+            }
+            Err(e) => self.set_status(e, true),
+        }
+    }
+
+    /// Open the right-click menu for what is under the pointer; the choice
+    /// comes back as [`Message::Menu`].
+    fn open_menu(&mut self, hit: Hit) {
+        let entries = menu::entries(hit, self.copied.is_some() || cce_ui::widget::clipboard::read_from_clipboard().is_some());
+        if entries.1.is_empty() {
+            return;
+        }
+        let sender = self.sender.clone();
+        std::thread::spawn(move || {
+            if let Some(id) = menu::show(&entries) {
+                let _ = sender.send(Message::Menu(id));
+            }
+        });
+    }
+
+    fn menu_action(&mut self, id: &str) {
+        match id {
+            menu::CUT => self.copy(true),
+            menu::COPY => self.copy(false),
+            menu::PASTE => self.paste(),
+            menu::CLEAR => self.clear_selection(),
+            menu::INSERT_ROWS_ABOVE => self.structure(Line::Rows, true, false),
+            menu::INSERT_ROWS_BELOW => self.structure(Line::Rows, true, true),
+            menu::DELETE_ROWS => self.structure(Line::Rows, false, false),
+            menu::INSERT_COLS_LEFT => self.structure(Line::Cols, true, false),
+            menu::INSERT_COLS_RIGHT => self.structure(Line::Cols, true, true),
+            menu::DELETE_COLS => self.structure(Line::Cols, false, false),
+            menu::FIT_COLS => {
+                let [_, c1, _, c2] = ops::normalized(self.selection().range);
+                self.autofit(c1, c2);
+            }
+            other => log::warn!("unknown menu action {other:?}"),
+        }
     }
 
     fn navigate(&mut self, key: &Key) -> bool {
@@ -621,15 +864,15 @@ impl SheetsApp {
 impl Application for SheetsApp {
     type Message = Message;
 
-    fn create(_sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
+    fn create(sender: AppSender<Self::Message>) -> Self {
         let fs = cce_ui::create_font_system();
         let arg: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
         match arg {
             Some(path) => match Book::open(&path) {
-                Ok(book) => SheetsApp::with_book(book, None, fs),
-                Err(e) => SheetsApp::with_book(Book::untitled(), Some(format!("{}: {e}", path.display())), fs),
+                Ok(book) => SheetsApp::with_book(book, None, fs, sender),
+                Err(e) => SheetsApp::with_book(Book::untitled(), Some(format!("{}: {e}", path.display())), fs, sender),
             },
-            None => SheetsApp::with_book(Book::untitled(), None, fs),
+            None => SheetsApp::with_book(Book::untitled(), None, fs, sender),
         }
     }
 
@@ -644,8 +887,32 @@ impl Application for SheetsApp {
         }
     }
 
-    fn update(&mut self, msg: Self::Message, _needs_rebuild: &mut bool, _exit: &mut bool) {
-        match msg {}
+    fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, _exit: &mut bool) {
+        match msg {
+            Message::Menu(id) => {
+                if self.commit_edit() {
+                    self.menu_action(&id);
+                }
+                *needs_rebuild = true;
+            }
+        }
+    }
+
+    fn cursor_icon(&self, x: f32, y: f32) -> Option<CursorIcon> {
+        if let Some(rz) = &self.resize {
+            return Some(if rz.line == Line::Cols { CursorIcon::ColResize } else { CursorIcon::RowResize });
+        }
+        if self.fill.is_some() || self.frame.fill_handle.is_some_and(|r| contains(&r, x, y)) {
+            return Some(CursorIcon::Crosshair);
+        }
+        if self.frame.editor.is_some_and(|r| contains(&r, x, y)) || contains(&self.frame.content, x, y) {
+            return Some(CursorIcon::Text);
+        }
+        match self.view().hit(x, y) {
+            Hit::ColEdge(_) => Some(CursorIcon::ColResize),
+            Hit::RowEdge(_) => Some(CursorIcon::RowResize),
+            _ => None,
+        }
     }
 
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
@@ -665,6 +932,21 @@ impl Application for SheetsApp {
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        if self.resize.is_some() {
+            self.drag_resize(pos.x, pos.y);
+            *needs_rebuild = true;
+            return;
+        }
+        if self.fill.is_some() {
+            if let Hit::Cell { row, col } = self.view().hit(pos.x, pos.y) {
+                let to = ops::fill_target(self.selection().range, row, col);
+                if self.fill != Some(to) {
+                    self.fill = Some(to);
+                    *needs_rebuild = true;
+                }
+            }
+            return;
+        }
         if self.edit_drag {
             let in_bar = self.editing.as_ref().is_some_and(|e| e.in_bar);
             if let Some(at) = self.edit_byte_at(pos.x, in_bar) {
@@ -691,11 +973,39 @@ impl Application for SheetsApp {
         pos: LogicalPosition,
         needs_rebuild: &mut bool,
     ) -> Option<Self::Message> {
+        if button == MouseButton::Right && state == ElementState::Pressed {
+            if !self.commit_edit() {
+                return None;
+            }
+            // A right-click outside the selection selects what it is on first.
+            let hit = self.view().hit(pos.x, pos.y);
+            let [r1, c1, r2, c2] = ops::normalized(self.selection().range);
+            let inside = match hit {
+                Hit::Cell { row, col } => (r1..=r2).contains(&row) && (c1..=c2).contains(&col),
+                Hit::ColHeader(c) => ops::whole_cols([r1, c1, r2, c2]) && (c1..=c2).contains(&c),
+                Hit::RowHeader(r) => ops::whole_rows([r1, c1, r2, c2]) && (r1..=r2).contains(&r),
+                _ => false,
+            };
+            if !inside {
+                self.select_hit(hit, false);
+            }
+            *needs_rebuild = true;
+            self.open_menu(hit);
+            return None;
+        }
         if button != MouseButton::Left {
             return None;
         }
         if state == ElementState::Released {
             self.selecting = false;
+            if self.resize.is_some() {
+                self.end_resize();
+                *needs_rebuild = true;
+            }
+            if self.fill.is_some() {
+                self.end_fill();
+                *needs_rebuild = true;
+            }
             if std::mem::take(&mut self.edit_drag) {
                 if let Some(ed) = self.editing.as_mut() {
                     ed.edit.release();
@@ -733,7 +1043,15 @@ impl Application for SheetsApp {
             self.sync_sheet();
             return None;
         }
+        if self.frame.fill_handle.is_some_and(|r| contains(&r, x, y)) {
+            self.fill = Some(None);
+            return None;
+        }
         let hit = self.view().hit(x, y);
+        if matches!(hit, Hit::ColEdge(_) | Hit::RowEdge(_)) {
+            self.press_edge(hit, x, y);
+            return None;
+        }
         if let Hit::Cell { row, col } = hit {
             let now = Instant::now();
             let double = self.last_press.is_some_and(|(t, r, c)| (r, c) == (row, col) && now.duration_since(t) < DOUBLE_CLICK);
@@ -816,7 +1134,24 @@ impl Application for SheetsApp {
         }
         let sheet = self.sheet();
         let sel = self.selection();
+        // Cell chords: the edit had first claim on these, as its own text's.
+        if let Some(chord) = cell_chord(event) {
+            let line = if ops::whole_cols(sel.range) { Line::Cols } else { Line::Rows };
+            match chord {
+                CellChord::Copy => self.copy(false),
+                CellChord::Cut => self.copy(true),
+                CellChord::Paste => self.paste(),
+                CellChord::Insert => self.structure(line, true, false),
+                CellChord::Delete => self.structure(line, false, false),
+            }
+            *needs_rebuild = true;
+            return None;
+        }
         let handled = match &event.logical_key {
+            Key::Named(NamedKey::Escape) if self.copied.is_some() => {
+                self.copied = None;
+                true
+            }
             Key::Named(NamedKey::F2) => {
                 self.edit_selected(false);
                 true
@@ -925,6 +1260,31 @@ impl Application for SheetsApp {
             ed.bar_shift = edit::keep_caret(ed.bar_shift, m.caret, m.width(), self.frame.content.width - 2.0 * text_in);
         }
 
+        // The fill handle sits on the selection's bottom-right corner, when
+        // that corner is on screen and nothing is being edited.
+        self.frame.fill_handle = None;
+        if self.editing.is_none() {
+            let [_, _, r2, c2] = ops::normalized(self.selection().range);
+            let view = self.view();
+            let corner = view.cell_rect(r2, c2);
+            let (cx, cy) = (corner.x + corner.width, corner.y + corner.height);
+            let body = view.body();
+            let (x0, x1) = view.col_band(c2);
+            let (y0, y1) = view.row_band(r2);
+            if cx > x0 && cx <= x1 + 1.0 && cy > y0 && cy <= y1 + 1.0 && cx <= body.x + body.width && cy <= body.y + body.height {
+                let h = FILL_HANDLE;
+                self.frame.fill_handle = Some(Rect { x: cx - h / 2.0 - 1.0, y: cy - h / 2.0 - 1.0, width: h, height: h });
+            }
+        }
+        let overlay = grid::Overlay {
+            marquee: self.copied.as_ref().filter(|c| c.sheet == self.sheet()).map(|c| [c.range.0, c.range.1, c.range.2, c.range.3]),
+            fill_to: match self.fill {
+                Some(Some(to)) => Some(ops::filled_range(self.selection().range, to)),
+                _ => None,
+            },
+            fill_handle: self.frame.fill_handle,
+        };
+
         let mut pc = PaintCtx::new();
         pc.root_plate(size.width, size.height);
         self.paint_bar(&mut pc, &face, marks.as_ref());
@@ -937,6 +1297,7 @@ impl Application for SheetsApp {
         let sheet = self.sheet();
         pc.clip_rounded(well, radius, |pc| {
             grid::paint_sheet(pc, &self.book.model, sheet, &self.view(), &face, &sel, self.frame.editor);
+            grid::paint_overlay(pc, &self.view(), &face, &overlay);
             if let Some(m) = &marks {
                 self.paint_editor(pc, &face, m);
             }
@@ -988,6 +1349,37 @@ fn paint_field(pc: &mut PaintCtx, field: Rect, origin_x: f32, marks: &Marks, fac
         pc.quad(rect, [1.0, 1.0, 1.0, 0.95]);
         cce_ui::ime::report_caret(rect.x, rect.y, rect.width, rect.height);
     }
+}
+
+/// The chords that act on the selected cells when nothing is being edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellChord {
+    Copy,
+    Cut,
+    Paste,
+    /// ctrl++ (ctrl+shift+= on a US keyboard, reported either way): insert
+    /// rows, or columns for a whole-column selection.
+    Insert,
+    /// ctrl+-: delete them.
+    Delete,
+}
+
+fn cell_chord(event: &KeyEvent) -> Option<CellChord> {
+    let Key::Character(c) = &event.logical_key else {
+        return None;
+    };
+    if !event.ctrl || event.alt {
+        return None;
+    }
+    Some(match c.to_ascii_lowercase().as_str() {
+        "c" => CellChord::Copy,
+        "x" => CellChord::Cut,
+        "v" => CellChord::Paste,
+        "+" => CellChord::Insert,
+        "=" if event.shift => CellChord::Insert,
+        "-" => CellChord::Delete,
+        _ => return None,
+    })
 }
 
 fn contains(r: &Rect, x: f32, y: f32) -> bool {

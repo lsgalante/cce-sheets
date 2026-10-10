@@ -520,6 +520,7 @@ dependencies = [
  "env_logger",
  "ironcalc",
  "log",
+ "serde_json",
 ]
 
 [[package]]

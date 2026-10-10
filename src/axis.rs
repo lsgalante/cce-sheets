@@ -114,6 +114,26 @@ impl Axis {
         lo
     }
 
+    /// This axis with index `i` measuring `size`: what a resize drag shows
+    /// before it is written to the model.
+    pub fn with_size(&self, i: i32, size: f64) -> Axis {
+        let mut runs: Vec<(i32, i32, f64)> = Vec::with_capacity(self.runs.len() + 2);
+        for r in &self.runs {
+            if i < r.start || i > r.end {
+                runs.push((r.start, r.end, r.size));
+                continue;
+            }
+            if r.start < i {
+                runs.push((r.start, i - 1, r.size));
+            }
+            if i < r.end {
+                runs.push((i + 1, r.end, r.size));
+            }
+        }
+        runs.push((i, i, size));
+        Axis::new(self.default, self.last, runs)
+    }
+
     /// The last run starting at or before `i`.
     fn run_at_or_before(&self, i: i32) -> Option<usize> {
         let n = self.runs.partition_point(|r| r.start <= i);
@@ -184,6 +204,17 @@ mod tests {
         let a = Axis::new(10.0, 20, [(1, 2, 0.0)]);
         assert_eq!(a.index_at(0.0), 3);
         assert_eq!(a.index_at(1.0), 3);
+    }
+
+    #[test]
+    fn with_size_overrides_one_index_and_splits_its_run() {
+        let a = Axis::new(10.0, 20, [(3, 6, 20.0)]);
+        let b = a.with_size(4, 50.0);
+        assert_eq!((b.size(3), b.size(4), b.size(5), b.size(6), b.size(7)), (20.0, 50.0, 20.0, 20.0, 10.0));
+        assert_eq!(b.end(6), a.end(6) + 30.0);
+        // Back to the default size: the run is dropped there.
+        let c = Axis::new(10.0, 20, []).with_size(2, 33.0).with_size(2, 10.0);
+        assert_eq!(c, Axis::new(10.0, 20, []));
     }
 
     #[test]

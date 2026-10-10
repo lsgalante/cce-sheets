@@ -370,6 +370,65 @@ fn paint_cursor(pc: &mut PaintCtx, view: &View, face: &Face, sel: &Selection) {
     clipped_to_cell_band(pc, view, sel.row, sel.col, |pc| frame(pc, r, cursor_color(face)));
 }
 
+/// What is drawn over the cells besides the selection: the copied range's
+/// marquee, a fill drag's reach, and the fill handle.
+pub struct Overlay {
+    pub marquee: Option<[i32; 4]>,
+    pub fill_to: Option<[i32; 4]>,
+    pub fill_handle: Option<Rect>,
+}
+
+pub fn paint_overlay(pc: &mut PaintCtx, view: &View, face: &Face, o: &Overlay) {
+    let body = view.body();
+    let cursor = cursor_color(face);
+    pc.clip(body, |pc| {
+        if let Some(r) = o.marquee.and_then(|r| range_rect(view, r)) {
+            dashed(pc, r, cursor);
+        }
+        if let Some(r) = o.fill_to.and_then(|r| range_rect(view, r)) {
+            dashed(pc, r, [1.0, 1.0, 1.0, 0.7]);
+        }
+    });
+    if let Some(h) = o.fill_handle {
+        // A dark collar first, so the square reads on any fill.
+        pc.quad(Rect { x: h.x - 1.0, y: h.y - 1.0, width: h.width + 2.0, height: h.height + 2.0 }, [0.0, 0.0, 0.0, 0.6]);
+        pc.quad(h, cursor);
+    }
+}
+
+/// A range's box on screen, clamped to a little past the body so a whole
+/// column (26 million px tall) stays a box of screen size.
+fn range_rect(view: &View, range: [i32; 4]) -> Option<Rect> {
+    let [r1, c1, r2, c2] = normalized(range);
+    let a = view.cell_rect(r1, c1);
+    let b = view.cell_rect(r2, c2);
+    let body = view.body();
+    let x0 = a.x.max(body.x - 4.0);
+    let y0 = a.y.max(body.y - 4.0);
+    let x1 = (b.x + b.width).min(body.x + body.width + 4.0);
+    let y1 = (b.y + b.height).min(body.y + body.height + 4.0);
+    (x1 > x0 && y1 > y0).then_some(Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 })
+}
+
+/// A 2px dashed outline just inside `r`.
+fn dashed(pc: &mut PaintCtx, r: Rect, c: [f32; 4]) {
+    let (t, dash, gap): (f32, f32, f32) = (2.0, 5.0, 4.0);
+    let mut x = r.x;
+    while x < r.x + r.width {
+        let w = dash.min(r.x + r.width - x);
+        pc.quad(Rect { x, y: r.y, width: w, height: t }, c);
+        pc.quad(Rect { x, y: r.y + r.height - t, width: w, height: t }, c);
+        x += dash + gap;
+    }
+    let mut y = r.y;
+    while y < r.y + r.height {
+        let h = dash.min(r.y + r.height - y);
+        pc.quad(Rect { x: r.x, y, width: t, height: h }, c);
+        pc.quad(Rect { x: r.x + r.width - t, y, width: t, height: h }, c);
+        y += dash + gap;
+    }
+}
+
 /// The cursor's colour: the highlight lifted a third toward white, so the
 /// frame reads on a filled cell as well as on the bare well.
 pub fn cursor_color(face: &Face) -> [f32; 4] {

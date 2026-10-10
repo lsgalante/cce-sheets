@@ -36,9 +36,16 @@ pub enum Hit {
     Cell { row: i32, col: i32 },
     ColHeader(i32),
     RowHeader(i32),
+    /// The right edge of a column's header: a resize grip.
+    ColEdge(i32),
+    /// The bottom edge of a row's header.
+    RowEdge(i32),
     Corner,
     Outside,
 }
+
+/// How near a header edge a press must land to grab it.
+pub const EDGE_GRIP: f32 = 4.0;
 
 /// The cells and headers of one axis that are on screen: the frozen span
 /// (`1..=frozen`, possibly empty) and the scrolled span.
@@ -147,8 +154,22 @@ impl<'a> View<'a> {
         let row = || axis_hit(&self.geom.rows, self.geom.frozen_rows, self.geom.frozen_h(), (py - b.y) as f64, self.scroll.1);
         match (in_cols, in_rows) {
             (false, false) => Hit::Corner,
-            (true, false) => Hit::ColHeader(col()),
-            (false, true) => Hit::RowHeader(row()),
+            (true, false) => {
+                let c = col();
+                match edge(self.col_x(c) as f32, self.geom.cols.size(c) as f32, px) {
+                    Some(0) => Hit::ColEdge(c),
+                    Some(_) if c > 1 => Hit::ColEdge(c - 1),
+                    _ => Hit::ColHeader(c),
+                }
+            }
+            (false, true) => {
+                let r = row();
+                match edge(self.row_y(r) as f32, self.geom.rows.size(r) as f32, py) {
+                    Some(0) => Hit::RowEdge(r),
+                    Some(_) if r > 1 => Hit::RowEdge(r - 1),
+                    _ => Hit::RowHeader(r),
+                }
+            }
             (true, true) => Hit::Cell { row: row(), col: col() },
         }
     }
@@ -170,6 +191,18 @@ impl<'a> View<'a> {
             reveal(self.scroll.1, g.rows.start(row) - g.frozen_h(), g.rows.end(row) - g.frozen_h(), vh)
         };
         (x, y)
+    }
+}
+
+/// Whether `p` is on the far edge (`Some(0)`) or the near edge (`Some(1)`)
+/// of the span `start..start + size`, within [`EDGE_GRIP`].
+fn edge(start: f32, size: f32, p: f32) -> Option<u8> {
+    if start + size - p <= EDGE_GRIP {
+        Some(0)
+    } else if p - start <= EDGE_GRIP {
+        Some(1)
+    } else {
+        None
     }
 }
 
@@ -250,6 +283,13 @@ mod tests {
         assert_eq!(v.hit(60.0, 55.0), Hit::ColHeader(1));
         assert_eq!(v.hit(160.0, 55.0), Hit::ColHeader(4));
         assert_eq!(v.hit(15.0, 75.0), Hit::RowHeader(1));
+        // Header edges grab: column 1 (frozen) ends at x=150, scrolled
+        // column 4 at x=200; a row's bottom edge likewise, its top one only
+        // when there is a row above to resize.
+        assert_eq!(v.hit(148.0, 55.0), Hit::ColEdge(1));
+        assert_eq!(v.hit(198.0, 55.0), Hit::ColEdge(4));
+        assert_eq!(v.hit(15.0, 88.0), Hit::RowEdge(1));
+        assert_eq!(v.hit(15.0, 72.0), Hit::RowHeader(1));
         // y=70+40 is the frozen edge: the first scrolled row, 3 + 100/20 = 8.
         assert_eq!(v.hit(60.0, 110.0), Hit::Cell { row: 8, col: 1 });
         assert_eq!(v.hit(5.0, 75.0), Hit::Outside);
