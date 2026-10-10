@@ -76,7 +76,29 @@ pub fn paste_cells(model: &mut UserModel, c: &Copied) -> Result<(), String> {
 pub fn paste_text(model: &mut UserModel, text: &str) -> Result<(), String> {
     let view = model.get_selected_view();
     let area = Area { sheet: view.sheet, row: view.row, column: view.column, width: 1, height: 1 };
-    model.paste_csv_string(&area, &normalize(text))
+    model.paste_csv_string(&area, &rectangular(&normalize(text))?)
+}
+
+/// Rows of values as the tab-separated text IronCalc's paste reads: quoted
+/// where a value holds a tab, quote or newline, and every row padded to the
+/// widest. The paste's reader is strict about record lengths and silently
+/// SKIPS a row shorter than the first.
+pub fn as_tsv(rows: &[Vec<String>]) -> Result<String, String> {
+    let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut w = csv::WriterBuilder::new().delimiter(b'\t').from_writer(vec![]);
+    for r in rows {
+        let padded = r.iter().cloned().chain(std::iter::repeat_n(String::new(), width - r.len()));
+        w.write_record(padded).map_err(|e| e.to_string())?;
+    }
+    String::from_utf8(w.into_inner().map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+/// Tab-separated text from anywhere, ragged rows and all, made rectangular
+/// for the paste (see [`as_tsv`]).
+fn rectangular(text: &str) -> Result<String, String> {
+    let mut r = csv::ReaderBuilder::new().delimiter(b'\t').has_headers(false).flexible(true).from_reader(text.as_bytes());
+    let rows: Vec<Vec<String>> = r.records().map(|rec| rec.map(|rec| rec.iter().map(str::to_string).collect())).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+    as_tsv(&rows)
 }
 
 #[cfg(test)]
@@ -128,6 +150,17 @@ mod tests {
         paste_text(&mut m, "x\t2\r\n3\t=B5+C4\r\n").unwrap();
         assert_eq!(m.get_formatted_cell_value(0, 4, 2).unwrap(), "x");
         assert_eq!(m.get_formatted_cell_value(0, 5, 3).unwrap(), "5");
+    }
+
+    #[test]
+    fn ragged_text_keeps_every_row() {
+        let mut m = model();
+        m.set_selected_cell(10, 1).unwrap();
+        // Lines with different numbers of fields, as text copied from a
+        // document has: none may be dropped.
+        paste_text(&mut m, "a\tb\tc\nd\ne\tf\n").unwrap();
+        assert_eq!(m.get_formatted_cell_value(0, 11, 1).unwrap(), "d");
+        assert_eq!(m.get_formatted_cell_value(0, 12, 2).unwrap(), "f");
     }
 
     #[test]

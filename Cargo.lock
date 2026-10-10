@@ -515,6 +515,7 @@ dependencies = [
 name = "cce-sheets"
 version = "0.1.0"
 dependencies = [
+ "calloop",
  "cce-ui",
  "csv",
  "env_logger",

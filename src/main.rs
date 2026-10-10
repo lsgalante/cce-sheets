@@ -25,10 +25,14 @@
 //! colours and borders on the selection. Typing a function name in a formula
 //! offers completions: Up/Down pick, Tab or Enter takes one, Escape closes.
 //!
+//! Agents read and edit the workbook over MCP (`mcp.rs`; the first window
+//! open serves http://127.0.0.1:3003/mcp).
+//!
 //! Closing with unsaved changes keeps them: `on_exit` writes a recovery copy
 //! under `$XDG_STATE_HOME/cce-sheets/recovered/` (the toolkit has no way to
 //! ask before a window closes).
 
+mod addr;
 mod axis;
 mod book;
 mod clip;
@@ -36,6 +40,7 @@ mod edit;
 mod format;
 mod functions;
 mod grid;
+mod mcp;
 mod menu;
 mod ops;
 mod toolbar;
@@ -71,6 +76,8 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 enum Message {
     /// A row chosen in the right-click menu, by its id.
     Menu(String),
+    /// An agent's tool call, run on the event loop (see `mcp.rs`).
+    Mcp(cce_ui::mcp::McpToolCall),
 }
 
 /// A header edge being dragged: the column or row, where the drag began,
@@ -982,6 +989,7 @@ impl Application for SheetsApp {
     type Message = Message;
 
     fn create(sender: AppSender<Self::Message>) -> Self {
+        mcp::start(sender.clone().into());
         let fs = cce_ui::create_font_system();
         let arg: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
         match arg {
@@ -1010,6 +1018,10 @@ impl Application for SheetsApp {
                 if self.commit_edit() {
                     self.menu_action(&id);
                 }
+                *needs_rebuild = true;
+            }
+            Message::Mcp(call) => {
+                self.mcp_call(call);
                 *needs_rebuild = true;
             }
         }

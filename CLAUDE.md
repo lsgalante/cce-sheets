@@ -35,7 +35,10 @@ and fill colours, borders — drawn as ButtonStrip-style strips with cce-icons
 glyphs; the grid now draws borders, underline and strikethrough; typing a
 function name in a formula offers completions (Up/Down, Tab or Enter, Escape).
 
-Planned next: an MCP server (M5), vault markdown tables (M6).
+Milestone 5 (done): an MCP server, so agents read and edit the workbook in
+the running window — see "MCP" below.
+
+Planned next: vault markdown tables (M6).
 
 ## Layout
 
@@ -52,6 +55,8 @@ Planned next: an MCP server (M5), vault markdown tables (M6).
 | `src/menu.rs` | `cce-cloud --json` popups: the right-click menu and the toolbar's format/colour/border menus |
 | `src/format.rs` | the selected cell's formatting (`Active`) and the style writes: toggles, alignment, number formats, palette, borders |
 | `src/toolbar.rs` | toolbar layout, hit test and paint; `strip`, the recessed-strip painter the sheet tabs share |
+| `src/mcp.rs` | MCP tools (`workbook`, `read_range`, `write_cells`, `clear_range`, `format_range`, `change_lines`, `find`, `add_sheet`, `rename_sheet`, `select`, `undo`, `redo`, `save`, `open`) |
+| `src/addr.rs` | A1 addresses: cells, ranges, whole columns/rows, `Sheet!` prefixes |
 | `src/functions.rs` | every function's name, GENERATED as field accessors of `language::Functions` (regenerate on an ironcalc bump) |
 
 ## Rules
@@ -117,8 +122,29 @@ Planned next: an MCP server (M5), vault markdown tables (M6).
 - `BorderArea`, like the clipboard, is built through serde (private fields,
   public `Deserialize`). Dark borders on the bare grid take the label colour,
   as text does.
+- **IronCalc's `paste_csv_string` has two traps** (both met by this app):
+  its reader is strict about record lengths and silently SKIPS a row shorter
+  than the first — every paste goes through `clip::as_tsv`, which pads — and
+  it ends by selecting what it pasted, which it refuses unless the selected
+  cell is that range's corner, so a write elsewhere points the selection there
+  and puts the person's selection back after (`mcp.rs` `write_cells`).
 - Model strings borrow for the model's life (`Model<'a>`): construct with the
   `'static` constants in `book.rs`, then rename.
+
+## MCP
+
+`claude mcp add --transport http cce-sheets http://127.0.0.1:3003/mcp`.
+cce-ui's tools-only server (`cce_ui::mcp`); calls run on the event loop
+against the model the window draws, through the same paths as the keyboard:
+an open edit is committed first, every write is an undo step the person at
+the window can take back, the window's selection does not move unless the
+call is `select`, and the window repaints after. Each window is its own
+process, so only the first one open holds the port; a later one logs that it
+is taken. `CCE_SHEETS_MCP_PORT` moves it — use one (3903) for a shadow, since
+a live window may hold 3003. `mcp.rs`'s tests build a real `SheetsApp` and
+drive `mcp_dispatch`, and `every_listed_tool_is_dispatched` keeps the tool
+list and the dispatcher in step. To drive the HTTP side by hand:
+`curl -s -X POST http://127.0.0.1:3903/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"workbook","arguments":{}}}'`.
 
 ## Build, test, verify
 
