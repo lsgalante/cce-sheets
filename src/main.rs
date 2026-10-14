@@ -1,4 +1,4 @@
-//! cce-sheets — spreadsheets for the cce desktop.
+//! cce-spreadsheet — spreadsheets for the cce desktop.
 //!
 //! The workbook is IronCalc's `UserModel`, which owns the cells, formulas,
 //! styles and the selection; this app draws it and turns input into model
@@ -29,7 +29,7 @@
 //! open serves http://127.0.0.1:3003/mcp).
 //!
 //! Closing with unsaved changes keeps them: `on_exit` writes a recovery copy
-//! under `$XDG_STATE_HOME/cce-sheets/recovered/` (the toolkit has no way to
+//! under `$XDG_STATE_HOME/cce-spreadsheet/recovered/` (the toolkit has no way to
 //! ask before a window closes).
 
 mod addr;
@@ -132,7 +132,7 @@ struct Status {
     error: bool,
 }
 
-struct SheetsApp {
+struct SpreadsheetApp {
     sender: AppSender<Message>,
     book: Book,
     /// Cells copied or cut here, until pasted (a cut) or let go (Escape).
@@ -171,11 +171,11 @@ struct SheetsApp {
     shift: bool,
 }
 
-impl SheetsApp {
+impl SpreadsheetApp {
     fn with_book(book: Book, error: Option<String>, font_system: cce_ui::cosmic_text::FontSystem, sender: AppSender<Message>) -> Self {
         let sheet = book.model.get_selected_sheet();
         let geom = grid::sheet_geom(&book.model, sheet);
-        SheetsApp {
+        SpreadsheetApp {
             sender,
             book,
             copied: None,
@@ -986,7 +986,7 @@ impl SheetsApp {
     }
 }
 
-impl Application for SheetsApp {
+impl Application for SpreadsheetApp {
     type Message = Message;
 
     fn create(sender: AppSender<Self::Message>) -> Self {
@@ -995,17 +995,17 @@ impl Application for SheetsApp {
         let arg: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
         match arg {
             Some(path) => match Book::open(&path) {
-                Ok(book) => SheetsApp::with_book(book, None, fs, sender),
-                Err(e) => SheetsApp::with_book(Book::untitled(), Some(format!("{}: {e}", path.display())), fs, sender),
+                Ok(book) => SpreadsheetApp::with_book(book, None, fs, sender),
+                Err(e) => SpreadsheetApp::with_book(Book::untitled(), Some(format!("{}: {e}", path.display())), fs, sender),
             },
-            None => SheetsApp::with_book(Book::untitled(), None, fs, sender),
+            None => SpreadsheetApp::with_book(Book::untitled(), None, fs, sender),
         }
     }
 
     fn settings(&self) -> WindowSettings {
         WindowSettings {
-            title: format!("{}{} — Sheets", if self.dirty { "*" } else { "" }, self.book.display_name()),
-            app_id: "cce-sheets".to_string(),
+            title: format!("{}{} — Spreadsheet", if self.dirty { "*" } else { "" }, self.book.display_name()),
+            app_id: "cce-spreadsheet".to_string(),
             width: 1100,
             height: 760,
             fullscreen: false,
@@ -1599,5 +1599,5 @@ fn contains(r: &Rect, x: f32, y: f32) -> bool {
 
 fn main() {
     env_logger::init();
-    cce_ui::engine::run::<SheetsApp>();
+    cce_ui::engine::run::<SpreadsheetApp>();
 }

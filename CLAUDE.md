@@ -1,6 +1,7 @@
-# CLAUDE.md — cce-sheets
+# CLAUDE.md — cce-spreadsheet
 
-Spreadsheets for the cce desktop. Read the workspace guide
+Spreadsheets for the cce desktop. Called cce-sheets until 2026-10-13 (GitHub
+redirects the old repo URL; recovered files moved to the new state dir). Read the workspace guide
 `../cce-compositor/WORKSPACE.md` first (multi-repo layout, `ccebuild`, concurrent
 sessions) and `../cce-ui/CLAUDE.md` for the toolkit.
 
@@ -38,7 +39,7 @@ function name in a formula offers completions (Up/Down, Tab or Enter, Escape).
 Milestone 5 (done): an MCP server, so agents read and edit the workbook in
 the running window — see "MCP" below.
 
-Milestone 6 (done): a Markdown note opens as its tables — `cce-sheets
+Milestone 6 (done): a Markdown note opens as its tables — `cce-spreadsheet
 note.md`, ctrl+o, or MCP `open` — one sheet per table named after the heading
 above it, header row bold and frozen, columns aligned by their delimiter
 markers; Save writes each table back over its own lines. Vault .xlsx/.csv
@@ -49,7 +50,7 @@ and this app is the default for those types).
 
 | file | role |
 |---|---|
-| `src/main.rs` | `SheetsApp` (the `Application`): window layout, bar, sheet tabs, input |
+| `src/main.rs` | `SpreadsheetApp` (the `Application`): window layout, bar, sheet tabs, input |
 | `src/book.rs` | `Book`: open .xlsx (IronCalc) or delimited text (sniffed separator); `column_name` |
 | `src/axis.rs` | `Axis`: one dimension's sizes — default + sparse runs, O(log n) `start` / `index_at` |
 | `src/view.rs` | `View`: headers, frozen quadrants, scroll, hit test, scroll-into-view (pure, tested) |
@@ -92,9 +93,9 @@ and this app is the default for those types).
   IronCalc's own `save_to_xlsx` refuses an existing file and unwraps the create;
   use `save_xlsx_to_writer` through `book::write_atomic`.
 - **No close prompt exists in the toolkit**, so `on_exit` commits an open edit
-  and writes unsaved changes to `$XDG_STATE_HOME/cce-sheets/recovered/` (an open
+  and writes unsaved changes to `$XDG_STATE_HOME/cce-spreadsheet/recovered/` (an open
   over a dirty workbook does the same).
-- Every model change goes through `SheetsApp::changed` (unsaved mark, sizes
+- Every model change goes through `SpreadsheetApp::changed` (unsaved mark, sizes
   re-read, and the engine's collaboration send-queue dropped — it grows forever
   otherwise).
 - Delete clamps the range to the used extent: `range_clear_contents` walks every
@@ -116,7 +117,7 @@ and this app is the default for those types).
 - **Glyphs come from cce-icons** (`bold`, `italic`, `underline`,
   `align-left/center/right`, `fill`, `borders`, plus `font`, `chevron-down`) —
   never letters in a fallback font. The app icon is `table.svg`
-  (`hicolor/scalable/apps/cce-sheets.svg`).
+  (`hicolor/scalable/apps/cce-spreadsheet.svg`).
 - **Anything drawn over text must hide that text**: the editor and the
   completion list are passed to `paint_sheet(.., hide)` (cells and header
   labels under them draw no text) and to `toolbar::paint`. A box alone cannot
@@ -148,15 +149,15 @@ and this app is the default for those types).
 
 ## MCP
 
-`claude mcp add --transport http cce-sheets http://127.0.0.1:3003/mcp`.
+`claude mcp add --transport http cce-spreadsheet http://127.0.0.1:3003/mcp`.
 cce-ui's tools-only server (`cce_ui::mcp`); calls run on the event loop
 against the model the window draws, through the same paths as the keyboard:
 an open edit is committed first, every write is an undo step the person at
 the window can take back, the window's selection does not move unless the
 call is `select`, and the window repaints after. Each window is its own
 process, so only the first one open holds the port; a later one logs that it
-is taken. `CCE_SHEETS_MCP_PORT` moves it — use one (3903) for a shadow, since
-a live window may hold 3003. `mcp.rs`'s tests build a real `SheetsApp` and
+is taken. `CCE_SPREADSHEET_MCP_PORT` moves it — use one (3903) for a shadow, since
+a live window may hold 3003. `mcp.rs`'s tests build a real `SpreadsheetApp` and
 drive `mcp_dispatch`, and `every_listed_tool_is_dispatched` keeps the tool
 list and the dispatcher in step. To drive the HTTP side by hand:
 `curl -s -X POST http://127.0.0.1:3903/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"workbook","arguments":{}}}'`.
@@ -164,16 +165,16 @@ list and the dispatcher in step. To drive the HTTP side by hand:
 ## Build, test, verify
 
 ```sh
-cargo build -p cce-sheets
-cargo test  -p cce-sheets            # headless: axis, view, loaders, geometry, number fitting
-cargo clippy -p cce-sheets --all-targets
-make install                         # release build + ccebuild install --no-build cce-sheets
+cargo build -p cce-spreadsheet
+cargo test  -p cce-spreadsheet            # headless: axis, view, loaders, geometry, number fitting
+cargo clippy -p cce-spreadsheet --all-targets
+make install                         # release build + ccebuild install --no-build cce-spreadsheet
 ```
 
 Verify drawing and input in a shadow at **both** scale 1 and `--scale 2`
 (`cce-shadow start --new [--scale 2]`, then
-`cce-shadow spawn env CCE_FONTS_DIR=… CCE_ICONS_DIR=… /abs/path/target/release/cce-sheets file.xlsx`
-and `ctl set-mode fullscreen cce-sheets` once the window is listed — the scale-2
+`cce-shadow spawn env CCE_FONTS_DIR=… CCE_ICONS_DIR=… /abs/path/target/release/cce-spreadsheet file.xlsx`
+and `ctl set-mode fullscreen cce-spreadsheet` once the window is listed — the scale-2
 output is only 640×360 logical). Keys with modifiers need a real keyboard:
 `cce-shadow run ../cce-compositor/verify/clients/target/release/vkey mod:4 44`
 (ctrl+z); `ccectl keypress` carries no modifier state. The right-click menu
@@ -189,9 +190,9 @@ Never run a new build on the live seat.
 **Installing while cce-ui is dirty** (another session's work in the tree): a
 workspace build would ship it. Build this crate alone at its pin instead —
 `git archive HEAD` into a scratch dir, `cargo build --release --locked` with a
-private `CARGO_TARGET_DIR`, then `install -m755 … ~/.local/bin/cce-sheets.new &&
+private `CARGO_TARGET_DIR`, then `install -m755 … ~/.local/bin/cce-spreadsheet.new &&
 mv` (the desktop entry is ccebuild's; reinstall it with `ccebuild install
---no-build cce-sheets` only from a clean-tree build).
+--no-build cce-spreadsheet` only from a clean-tree build).
 
 Not done yet: merged cells, wrapped text and vertical alignment, per-cell font
 sizes and faces (every cell is the DE label font), conditional formatting, ODS.

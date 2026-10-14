@@ -412,14 +412,14 @@ fn write_atomic(path: &Path, write: impl FnOnce(&mut BufWriter<File>) -> Result<
 }
 
 /// Where a workbook with unsaved changes is kept when the window closes:
-/// `$XDG_STATE_HOME/cce-sheets/recovered/<name>-<unix seconds>.xlsx`.
+/// `$XDG_STATE_HOME/cce-spreadsheet/recovered/<name>-<unix seconds>.xlsx`.
 pub fn recovery_path(name: &str, now_secs: u64) -> Option<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
     let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
-    Some(state.join("cce-sheets/recovered").join(format!("{stem}-{now_secs}.xlsx")))
+    Some(state.join("cce-spreadsheet/recovered").join(format!("{stem}-{now_secs}.xlsx")))
 }
 
 /// Save the workbook to a recovery file; where it went, or why not.
@@ -497,7 +497,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("cce-sheets-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cce-spreadsheet-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -591,7 +591,7 @@ mod tests {
     #[test]
     fn recovery_lands_under_the_state_dir() {
         let p = recovery_path("budget.xlsx", 42).unwrap();
-        assert!(p.ends_with("cce-sheets/recovered/budget-42.xlsx"));
+        assert!(p.ends_with("cce-spreadsheet/recovered/budget-42.xlsx"));
     }
 
     #[test]

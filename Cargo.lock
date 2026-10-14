@@ -512,7 +512,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cce-sheets"
+name = "cce-spreadsheet"
 version = "0.1.0"
 dependencies = [
  "calloop",

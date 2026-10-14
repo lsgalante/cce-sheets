@@ -8,7 +8,7 @@ build:
 # here — hand-listing them is what left crates shipping incomplete for weeks.
 install: build
 	@command -v ccebuild >/dev/null || { echo "ccebuild not installed — run: make -C ../cce-compositor install"; exit 1; }
-	ccebuild install --no-build cce-sheets
+	ccebuild install --no-build cce-spreadsheet
 
 run:
 	cargo run

@@ -85,7 +85,7 @@ pub fn show((title, rows): &Menu) -> Option<String> {
     let (x, y) = (coord("x=")?, coord("y=")?);
     let layout = layout(title, rows).to_string();
     let mut child = std::process::Command::new(de_bin("cce-cloud"))
-        .args(["--json", "-x", &x.to_string(), "-y", &y.to_string(), "--parent-app-id", "cce-sheets"])
+        .args(["--json", "-x", &x.to_string(), "-y", &y.to_string(), "--parent-app-id", "cce-spreadsheet"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

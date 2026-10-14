@@ -2,11 +2,11 @@
 //! window (cce-ui's tools-only server, as cce-designer and cce-notes use):
 //!
 //! ```sh
-//! claude mcp add --transport http cce-sheets http://127.0.0.1:3003/mcp
+//! claude mcp add --transport http cce-spreadsheet http://127.0.0.1:3003/mcp
 //! ```
 //!
 //! Each window is its own process, so only the first one open serves; a
-//! later one finds the port taken and logs it. `CCE_SHEETS_MCP_PORT` moves
+//! later one finds the port taken and logs it. `CCE_SPREADSHEET_MCP_PORT` moves
 //! the port, for a second instance in a shadow.
 //!
 //! Calls run on the app's event loop against the same model the window
@@ -23,15 +23,15 @@ use crate::clip::as_tsv;
 use crate::addr::{cell_name, parse_cell, parse_range, range_name, split_sheet};
 use crate::book::{Book, FileKind};
 use crate::ops::Line;
-use crate::{format, grid, ops, Message, SheetsApp};
+use crate::{format, grid, ops, Message, SpreadsheetApp};
 
 const DEFAULT_PORT: u16 = 3003;
 /// The most cells one `read_range` returns.
 const MAX_READ: usize = 20_000;
 
 pub fn start(sender: calloop::channel::Sender<Message>) {
-    let port = std::env::var("CCE_SHEETS_MCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_PORT);
-    cce_ui::mcp::start_mcp_server("cce-sheets", port, tools(), sender, Message::Mcp);
+    let port = std::env::var("CCE_SPREADSHEET_MCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_PORT);
+    cce_ui::mcp::start_mcp_server("cce-spreadsheet", port, tools(), sender, Message::Mcp);
 }
 
 pub fn tools() -> Vec<McpTool> {
@@ -138,7 +138,7 @@ fn typed(v: &Value) -> String {
     }
 }
 
-impl SheetsApp {
+impl SpreadsheetApp {
     pub(crate) fn mcp_call(&mut self, call: McpToolCall) {
         let result = self.mcp_dispatch(&call.name, &call.arguments);
         let _ = call.reply.send(result);
@@ -470,12 +470,12 @@ mod tests {
         assert_eq!(m.get_formatted_cell_value(0, 2, 1).unwrap(), "say \"hi\"");
     }
 
-    fn app() -> SheetsApp {
+    fn app() -> SpreadsheetApp {
         let (tx, _rx) = calloop::channel::channel();
-        SheetsApp::with_book(Book::untitled(), None, cce_ui::create_font_system(), tx.into())
+        SpreadsheetApp::with_book(Book::untitled(), None, cce_ui::create_font_system(), tx.into())
     }
 
-    fn call(app: &mut SheetsApp, name: &str, args: Value) -> Result<Value, String> {
+    fn call(app: &mut SpreadsheetApp, name: &str, args: Value) -> Result<Value, String> {
         app.mcp_dispatch(name, &args)
     }
 
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn saving_and_opening_go_through_files() {
-        let dir = std::env::temp_dir().join(format!("cce-sheets-mcp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cce-spreadsheet-mcp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent.xlsx");
         let mut a = app();
