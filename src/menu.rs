@@ -1,6 +1,6 @@
 //! The right-click menu: a `cce-cloud --json` popup, the mechanism the
-//! desktop's, the window's and cce-desktop's menus use, so it looks and behaves
-//! like every other menu in the DE. (cce-ui's own context menu delivers only
+//! desktop's and the window's fallback menus use, so it looks and behaves
+//! like other menus in the DE. (cce-ui's own context menu delivers only
 //! the toolkit's fixed `ContextAction`s to a widget; this app's actions are
 //! its own.) Rows carry an action id; the choice comes back as that id.
 
