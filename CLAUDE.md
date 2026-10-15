@@ -61,7 +61,7 @@ and this app is the default for those types).
 | `src/menu.rs` | `cce-cloud --json` popups: the right-click menu and the toolbar's format/colour/border menus |
 | `src/format.rs` | the selected cell's formatting (`Active`) and the style writes: toggles, alignment, number formats, palette, borders |
 | `src/toolbar.rs` | toolbar layout, hit test and paint; `strip`, the recessed-strip painter the sheet tabs share |
-| `src/mcp.rs` | MCP tools (`workbook`, `read_range`, `write_cells`, `clear_range`, `format_range`, `change_lines`, `find`, `add_sheet`, `rename_sheet`, `select`, `undo`, `redo`, `save`, `open`) |
+| `src/mcp.rs` | MCP server (`server()`: each tool classed read/edit/outward, the brief, companions cce-notes and cce-calendar; `every_tool_is_classed` guards a new tool) and its tools (`context`, `workbook`, `read_range`, `write_cells`, `clear_range`, `format_range`, `change_lines`, `find`, `add_sheet`, `rename_sheet`, `select`, `undo`, `redo`, `save`, `open`) |
 | `src/md.rs` | GFM tables in a note: find (skipping fenced code), read cells, render, splice back in place |
 | `src/addr.rs` | A1 addresses: cells, ranges, whole columns/rows, `Sheet!` prefixes |
 | `src/functions.rs` | every function's name, GENERATED as field accessors of `language::Functions` (regenerate on an ironcalc bump) |

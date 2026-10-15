@@ -15,7 +15,7 @@
 //! the window is committed first, and the window repaints after.
 //! Addresses are A1 notation (`B2`, `A1:C5`, `B:D`, `2:4`, `Data!A1`).
 
-use cce_ui::mcp::{McpTool, McpToolCall};
+use cce_ui::mcp::{McpServer, McpTool, McpToolCall, ToolClass};
 use ironcalc::base::expressions::types::Area;
 use serde_json::{json, Value};
 
@@ -29,9 +29,60 @@ const DEFAULT_PORT: u16 = 3003;
 /// The most cells one `read_range` returns.
 const MAX_READ: usize = 20_000;
 
+/// The most rows and columns of the selection `context` quotes.
+const CONTEXT_ROWS: i32 = 30;
+const CONTEXT_COLS: i32 = 12;
+
+/// What the model is told about the spreadsheet when a client connects.
+const BRIEF: &str = "\
+cce-spreadsheet is the user's spreadsheet app (IronCalc formulas, .xlsx/.csv/.tsv, and the \
+tables of a Markdown note); the user keeps budgets and other records in it. Call `context` \
+first: it names the open file, the sheet on show, the selection and the selected cells' values. \
+Addresses are A1 notation (`B2`, `A1:C5`, `Data!A1`). Read with `read_range` and `find` before \
+writing. `write_cells` types values as a person would (`=` starts a formula). Every write is \
+one step of the window's undo history: take it back with `undo`. Nothing reaches the file \
+until `save`. The user's notes and calendar may be connected as well.";
+
 pub fn start(sender: calloop::channel::Sender<Message>) {
     let port = std::env::var("CCE_SPREADSHEET_MCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_PORT);
-    cce_ui::mcp::start_mcp_server("cce-spreadsheet", port, tools(), sender, Message::Mcp);
+    server().fixed_port(port).start(sender, Message::Mcp);
+}
+
+/// The server: the tools, what each does to the world, the brief, and the
+/// vault apps a client should load beside it.
+fn server() -> McpServer {
+    McpServer::new("cce-spreadsheet", tools())
+        .instructions(BRIEF)
+        .companions(&["cce-notes", "cce-calendar"])
+        .classify(ToolClass::Read, &["workbook", "read_range", "find"])
+        .classify(
+            ToolClass::Edit,
+            &["write_cells", "clear_range", "format_range", "change_lines", "add_sheet", "rename_sheet", "select", "undo", "redo"],
+        )
+        // Saving replaces the file on disk; opening replaces the workbook in
+        // the window. Neither is a step of the undo history.
+        .classify(ToolClass::Outward, &["save", "open"])
+}
+
+/// The `context` answer, from the `workbook` answer and the selected cells'
+/// shown values (rows of tab-separated values).
+fn context_from(workbook: &Value, selected_values: Option<String>) -> cce_ui::mcp::Context {
+    let file = workbook["file"].as_str();
+    let sel = &workbook["selected"];
+    cce_ui::mcp::Context {
+        document: Some(cce_ui::mcp::ContextDocument {
+            title: file
+                .and_then(|f| std::path::Path::new(f).file_name())
+                .map_or_else(|| "Untitled workbook".to_string(), |n| n.to_string_lossy().into_owned()),
+            path: file.map(str::to_string),
+        }),
+        view: json!({ "sheet": sel["sheet"], "sheets": workbook["sheets"], "editing": workbook["editing"] }),
+        selection: sel["range"].as_str().map(|r| format!("{}!{r}", sel["sheet"].as_str().unwrap_or_default())).into_iter().collect(),
+        dirty: workbook["unsaved"].as_bool(),
+        undo: Some("the `undo` tool: the window's undo history, one step per write".into()),
+        summary: selected_values,
+        ..cce_ui::mcp::Context::new(concat!("cce-spreadsheet ", env!("CARGO_PKG_VERSION")))
+    }
 }
 
 pub fn tools() -> Vec<McpTool> {
@@ -39,6 +90,7 @@ pub fn tools() -> Vec<McpTool> {
     let sheet = json!({ "type": "string", "description": "Sheet name; default the sheet the window shows. A `Sheet!` prefix on an address also names it." });
     let range = json!({ "type": "string", "description": "A1 address: `B2`, `A1:C5`, whole columns `B:D`, whole rows `2:4`, optionally `Sheet!`-prefixed" });
     vec![
+        cce_ui::mcp::context_tool(),
         tool(
             "workbook",
             "The open workbook: its file, whether it has unsaved changes, each sheet (name, visible, used range, frozen rows/columns) and what the window has selected.",
@@ -179,6 +231,7 @@ impl SpreadsheetApp {
 
     fn mcp_dispatch(&mut self, name: &str, args: &Value) -> Result<Value, String> {
         match name {
+            cce_ui::mcp::CONTEXT_TOOL => Ok(self.mcp_context()),
             "workbook" => Ok(self.mcp_workbook()),
             "read_range" => {
                 let (sheet, range) = self.mcp_range(args, "range")?;
@@ -414,6 +467,28 @@ impl SpreadsheetApp {
         self.book.model.get_worksheets_properties().get(sheet as usize).map(|p| p.name.clone()).unwrap_or_default()
     }
 
+    /// The `context` answer: `workbook`, plus the values of the selection's
+    /// top-left `CONTEXT_ROWS` x `CONTEXT_COLS` cells.
+    fn mcp_context(&self) -> Value {
+        let m = &self.book.model;
+        let v = m.get_selected_view();
+        let [r1, c1, r2, c2] = ops::normalized(v.range);
+        let rows: Vec<String> = (r1..=r2.min(r1 + CONTEXT_ROWS - 1))
+            .map(|r| {
+                (c1..=c2.min(c1 + CONTEXT_COLS - 1))
+                    .map(|c| m.get_formatted_cell_value(v.sheet, r, c).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect();
+        let shown = rows.iter().any(|r| !r.trim().is_empty()).then(|| {
+            let mut s = format!("Selected cells ({}), tab-separated:\n", range_name([r1, c1, r2, c2]));
+            s.push_str(&rows.join("\n"));
+            s
+        });
+        context_from(&self.mcp_workbook(), shown).into_result()
+    }
+
     fn mcp_workbook(&self) -> Value {
         let m = &self.book.model;
         let sheets: Vec<Value> = m
@@ -450,6 +525,33 @@ impl SpreadsheetApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_names_the_file_the_sheet_and_the_selection() {
+        let workbook = json!({
+            "file": "/home/u/Finance/budget.xlsx",
+            "unsaved": true,
+            "sheets": [{ "name": "2026" }],
+            "selected": { "sheet": "2026", "cell": "B4", "range": "B4:D9" },
+            "editing": null,
+        });
+        let c = context_from(&workbook, Some("Selected cells (B4:D9):\n1\t2".into())).into_result();
+        assert_eq!(c["document"]["title"], "budget.xlsx");
+        assert_eq!(c["selection"], json!(["2026!B4:D9"]));
+        assert_eq!(c["dirty"], true);
+        assert_eq!(c["view"]["sheet"], "2026");
+        assert!(c["summary"].as_str().unwrap().ends_with("1\t2"));
+
+        let untitled = context_from(&json!({ "file": null, "unsaved": false, "selected": {} }), None).into_result();
+        assert_eq!(untitled["document"]["title"], "Untitled workbook");
+        assert!(untitled.get("summary").is_none());
+    }
+
+    #[test]
+    fn every_tool_is_classed() {
+        // An unclassed tool makes the popup ask before every call.
+        assert!(server().unclassed().is_empty(), "classify these in server(): {:?}", server().unclassed());
+    }
 
     #[test]
     fn values_are_typed_as_a_person_would() {
