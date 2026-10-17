@@ -30,7 +30,8 @@
 //!
 //! Closing with unsaved changes keeps them: `on_exit` writes a recovery copy
 //! under `$XDG_STATE_HOME/cce-spreadsheet/recovered/` (the toolkit has no way to
-//! ask before a window closes).
+//! ask before a window closes). A launch reopens the file, sheet, selection
+//! and scroll the window last had (`ui_state.rs`).
 
 mod addr;
 mod axis;
@@ -45,6 +46,7 @@ mod md;
 mod menu;
 mod ops;
 mod toolbar;
+mod ui_state;
 mod view;
 
 use std::collections::HashMap;
@@ -228,6 +230,35 @@ impl SpreadsheetApp {
         self.scroll = (0.0, 0.0);
         self.scrolls.clear();
         self.scroll_motion = ScrollMotion::new();
+        self.remember();
+    }
+
+    /// Save where the window is, for its next launch (`ui_state`).
+    fn remember(&self) {
+        let sel = self.book.model.get_selected_view();
+        let sheet = self.book.model.get_worksheets_properties().get(sel.sheet as usize).map(|p| p.name.clone()).unwrap_or_default();
+        let view = ui_state::View { sheet, row: sel.row, col: sel.column, range: sel.range, scroll: self.scroll };
+        ui_state::save(self.book.path.as_deref(), Some(view));
+    }
+
+    /// Show the sheet, selection and scroll a launch is restoring, as far as
+    /// the workbook still has them: a sheet gone or hidden since is skipped,
+    /// a selection off the sheet is refused by the model, and the scroll is
+    /// clamped on the first frame.
+    fn restore_view(&mut self, v: &ui_state::View) {
+        let Some((sheet, _)) = self.visible_sheets().into_iter().find(|(_, name)| *name == v.sheet) else {
+            return;
+        };
+        let m = &mut self.book.model;
+        if m.set_selected_sheet(sheet).is_err() || m.set_selected_cell(v.row, v.col).is_err() {
+            return;
+        }
+        let [r1, c1, r2, c2] = v.range;
+        let _ = m.set_selected_range(r1, c1, r2, c2);
+        self.sync_sheet();
+        if v.scroll.0.is_finite() && v.scroll.1.is_finite() {
+            self.scroll = (v.scroll.0.max(0.0), v.scroll.1.max(0.0));
+        }
     }
 
     fn set_status(&mut self, text: String, error: bool) {
@@ -364,6 +395,8 @@ impl SpreadsheetApp {
         match self.book.save_to(&path) {
             Ok(note) => {
                 self.dirty = false;
+                // A save as is a new file to reopen.
+                self.remember();
                 let name = self.book.display_name();
                 let text = match note {
                     Some(n) => format!("{name}: {n}"),
@@ -993,13 +1026,24 @@ impl Application for SpreadsheetApp {
         mcp::start(sender.clone().into());
         let fs = cce_ui::create_font_system();
         let arg: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
-        match arg {
-            Some(path) => match Book::open(&path) {
+        // Coming back (`ui_state`): the workbook that was open, as it was shown.
+        let restored = ui_state::initial(arg.as_deref()).and_then(|s| Some((Book::open(s.file.as_deref()?).ok()?, s.view)));
+        let app = match (restored, arg) {
+            (Some((book, view)), _) => {
+                let mut app = SpreadsheetApp::with_book(book, None, fs, sender);
+                if let Some(v) = view {
+                    app.restore_view(&v);
+                }
+                app
+            }
+            (None, Some(path)) => match Book::open(&path) {
                 Ok(book) => SpreadsheetApp::with_book(book, None, fs, sender),
                 Err(e) => SpreadsheetApp::with_book(Book::untitled(), Some(format!("{}: {e}", path.display())), fs, sender),
             },
-            None => SpreadsheetApp::with_book(Book::untitled(), None, fs, sender),
-        }
+            (None, None) => SpreadsheetApp::with_book(Book::untitled(), None, fs, sender),
+        };
+        app.remember();
+        app
     }
 
     fn settings(&self) -> WindowSettings {
@@ -1394,10 +1438,12 @@ impl Application for SpreadsheetApp {
     }
 
     /// The window is going: an edit in progress is kept, and unsaved changes
-    /// go to a recovery copy (see the module doc).
+    /// go to a recovery copy (see the module doc); where it was is saved for
+    /// its next launch (`ui_state`).
     fn on_exit(&mut self) {
         self.commit_edit();
         self.keep_unsaved();
+        self.remember();
     }
 
     fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<DisplayList> {

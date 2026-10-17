@@ -521,6 +521,7 @@ dependencies = [
  "env_logger",
  "ironcalc",
  "log",
+ "serde",
  "serde_json",
 ]
 

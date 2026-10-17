@@ -443,6 +443,7 @@ impl SpreadsheetApp {
                 }
                 let note = self.book.save_to(&path)?;
                 self.dirty = false;
+                self.remember();
                 self.set_status(format!("saved {}", self.book.display_name()), false);
                 Ok(json!({ "file": path, "note": note }))
             }

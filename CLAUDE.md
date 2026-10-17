@@ -63,6 +63,7 @@ and this app is the default for those types).
 | `src/toolbar.rs` | toolbar layout, hit test and paint; `strip`, the recessed-strip painter the sheet tabs share |
 | `src/mcp.rs` | MCP server (`server()`: each tool classed read/edit/outward, the brief, companions cce-notes and cce-calendar; `every_tool_is_classed` guards a new tool) and its tools (`context`, `workbook`, `read_range`, `write_cells`, `clear_range`, `format_range`, `change_lines`, `find`, `add_sheet`, `rename_sheet`, `select`, `undo`, `redo`, `save`, `open`) |
 | `src/md.rs` | GFM tables in a note: find (skipping fenced code), read cells, render, splice back in place |
+| `src/ui_state.rs` | where the window was (file, sheet, selection, scroll) and the argv rule for reopening it (pure `choose`, tested) |
 | `src/addr.rs` | A1 addresses: cells, ranges, whole columns/rows, `Sheet!` prefixes |
 | `src/functions.rs` | every function's name, GENERATED as field accessors of `language::Functions` (regenerate on an ironcalc bump) |
 
@@ -95,6 +96,14 @@ and this app is the default for those types).
 - **No close prompt exists in the toolkit**, so `on_exit` commits an open edit
   and writes unsaved changes to `$XDG_STATE_HOME/cce-spreadsheet/recovered/` (an open
   over a dirty workbook does the same).
+- **A launch reopens where the window was** (`ui_state.rs`,
+  `$XDG_STATE_HOME/cce/spreadsheet/state.json`): the file, sheet (by name),
+  selection and scroll, saved on every open, save-as and `on_exit`. A
+  restart replays argv, so the file also records what argv named: the same
+  argv, or none, restores (even a file opened since); a different file on
+  argv wins and gets no saved view. A file that is gone is not reopened.
+  Restoring only opens the file as it is on disk; it never writes one and is
+  not the recovery copy.
 - Every model change goes through `SpreadsheetApp::changed` (unsaved mark, sizes
   re-read, and the engine's collaboration send-queue dropped — it grows forever
   otherwise).
